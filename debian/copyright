@@ -1,0 +1,16 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: helmfile
+Source: https://github.com/roboll/helmfile
+Files-Excluded: vendor Godeps/_workspace
+
+Files: *
+Copyright: 2016 rob boll
+License: TODO
+
+Files: debian/*
+Copyright: 2019 fsero <TODO>
+License: TODO
+Comment: Debian packaging is licensed under the same terms as upstream
+
+License: TODO
+TODO
