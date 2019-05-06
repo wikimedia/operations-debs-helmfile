@@ -18,12 +18,14 @@ import (
 	"os/exec"
 	"syscall"
 
+	"net/url"
+
 	"github.com/roboll/helmfile/environment"
 	"github.com/roboll/helmfile/event"
 	"github.com/roboll/helmfile/tmpl"
+	"github.com/tatsushid/go-prettytable"
 	"go.uber.org/zap"
 	"gopkg.in/yaml.v2"
-	"net/url"
 )
 
 // HelmState structure for the helmfile
@@ -31,13 +33,14 @@ type HelmState struct {
 	basePath           string
 	Environments       map[string]EnvironmentSpec
 	FilePath           string
-	HelmDefaults       HelmSpec         `yaml:"helmDefaults"`
-	Helmfiles          []string         `yaml:"helmfiles"`
-	DeprecatedContext  string           `yaml:"context"`
-	DeprecatedReleases []ReleaseSpec    `yaml:"charts"`
-	Namespace          string           `yaml:"namespace"`
-	Repositories       []RepositorySpec `yaml:"repositories"`
-	Releases           []ReleaseSpec    `yaml:"releases"`
+	HelmDefaults       HelmSpec          `yaml:"helmDefaults"`
+	Helmfiles          []SubHelmfileSpec `yaml:"helmfiles"`
+	DeprecatedContext  string            `yaml:"context"`
+	DeprecatedReleases []ReleaseSpec     `yaml:"charts"`
+	Namespace          string            `yaml:"namespace"`
+	Repositories       []RepositorySpec  `yaml:"repositories"`
+	Releases           []ReleaseSpec     `yaml:"releases"`
+	Selectors          []string
 
 	Templates map[string]TemplateSpec `yaml:"templates"`
 
@@ -51,6 +54,13 @@ type HelmState struct {
 	fileExists func(string) (bool, error)
 
 	runner helmexec.Runner
+}
+
+// SubHelmfileSpec defines the subhelmfile path and options
+type SubHelmfileSpec struct {
+	Path               string   //path or glob pattern for the sub helmfiles
+	Selectors          []string //chosen selectors for the sub helmfiles
+	SelectorsInherited bool     //do the sub helmfiles inherits from parent selectors
 }
 
 // HelmSpec to defines helmDefault values
@@ -140,6 +150,8 @@ type ReleaseSpec struct {
 
 	// generatedValues are values that need cleaned up on exit
 	generatedValues []string
+	//version of the chart that has really been installed cause desired version may be fuzzy (~2.0.0)
+	installedVersion string
 }
 
 // SetValue are the key values to set on a helm release
@@ -148,6 +160,13 @@ type SetValue struct {
 	Value  string   `yaml:"value"`
 	File   string   `yaml:"file"`
 	Values []string `yaml:"values"`
+}
+
+// AffectedReleases hold the list of released that where updated, deleted, or in error
+type AffectedReleases struct {
+	Upgraded []*ReleaseSpec
+	Deleted  []*ReleaseSpec
+	Failed   []*ReleaseSpec
 }
 
 const DefaultEnv = "default"
@@ -206,9 +225,6 @@ type syncPrepareResult struct {
 func (st *HelmState) prepareSyncReleases(helm helmexec.Interface, additionalValues []string, concurrency int) ([]syncPrepareResult, []error) {
 	releases := []*ReleaseSpec{}
 	for i, _ := range st.Releases {
-		if !st.Releases[i].Desired() {
-			continue
-		}
 		releases = append(releases, &st.Releases[i])
 	}
 
@@ -297,7 +313,9 @@ func (st *HelmState) DetectReleasesToBeDeleted(helm helmexec.Interface) ([]*Rele
 			if err != nil {
 				return nil, err
 			} else if installed {
-				detected = append(detected, &release)
+				// Otherwise `release` messed up(https://github.com/roboll/helmfile/issues/554)
+				r := release
+				detected = append(detected, &r)
 			}
 		}
 	}
@@ -305,7 +323,7 @@ func (st *HelmState) DetectReleasesToBeDeleted(helm helmexec.Interface) ([]*Rele
 }
 
 // SyncReleases wrapper for executing helm upgrade on the releases
-func (st *HelmState) SyncReleases(helm helmexec.Interface, additionalValues []string, workerLimit int) []error {
+func (st *HelmState) SyncReleases(affectedReleases *AffectedReleases, helm helmexec.Interface, additionalValues []string, workerLimit int) []error {
 	preps, prepErrs := st.prepareSyncReleases(helm, additionalValues, workerLimit)
 	if len(prepErrs) > 0 {
 		return prepErrs
@@ -337,11 +355,21 @@ func (st *HelmState) SyncReleases(helm helmexec.Interface, additionalValues []st
 						relErr = &ReleaseError{release, err}
 					} else if installed {
 						if err := helm.DeleteRelease(context, release.Name, "--purge"); err != nil {
+							affectedReleases.Failed = append(affectedReleases.Failed, release)
 							relErr = &ReleaseError{release, err}
+						} else {
+							affectedReleases.Deleted = append(affectedReleases.Deleted, release)
 						}
 					}
 				} else if err := helm.SyncRelease(context, release.Name, chart, flags...); err != nil {
+					affectedReleases.Failed = append(affectedReleases.Failed, release)
 					relErr = &ReleaseError{release, err}
+				} else {
+					affectedReleases.Upgraded = append(affectedReleases.Upgraded, release)
+					installedVersion, err := st.getDeployedVersion(context, helm, release)
+					//err is not really impacting so just ignors it
+					st.logger.Debugf("getting deployed release version failed:%v", err)
+					release.installedVersion = installedVersion
 				}
 
 				if relErr == nil {
@@ -369,12 +397,27 @@ func (st *HelmState) SyncReleases(helm helmexec.Interface, additionalValues []st
 			}
 		},
 	)
-
 	if len(errs) > 0 {
 		return errs
 	}
-
 	return nil
+}
+
+func (st *HelmState) getDeployedVersion(context helmexec.HelmContext, helm helmexec.Interface, release *ReleaseSpec) (string, error) {
+	//retrieve the version
+	if out, err := helm.List(context, "^"+release.Name+"$", st.tillerFlags(release)...); err == nil {
+		chartName := filepath.Base(release.Chart)
+		pat := regexp.MustCompile(chartName + "-(.*?)\\s")
+		versions := pat.FindStringSubmatch(out)
+		if len(versions) > 0 {
+			return versions[1], nil
+		} else {
+			//fails to find the version
+			return "failed to get version", errors.New("Failed to get the version for:" + chartName)
+		}
+	} else {
+		return "failed to get version", err
+	}
 }
 
 // downloadCharts will download and untar charts for Lint and Template
@@ -763,7 +806,7 @@ func (st *HelmState) ReleaseStatuses(helm helmexec.Interface, workerLimit int) [
 }
 
 // DeleteReleases wrapper for executing helm delete on the releases
-func (st *HelmState) DeleteReleases(helm helmexec.Interface, purge bool) []error {
+func (st *HelmState) DeleteReleases(affectedReleases *AffectedReleases, helm helmexec.Interface, purge bool) []error {
 	return st.scatterGatherReleases(helm, len(st.Releases), func(release ReleaseSpec, workerIndex int) error {
 		if !release.Desired() {
 			return nil
@@ -781,7 +824,13 @@ func (st *HelmState) DeleteReleases(helm helmexec.Interface, purge bool) []error
 			return err
 		}
 		if installed {
-			return helm.DeleteRelease(context, release.Name, flags...)
+			if err := helm.DeleteRelease(context, release.Name, flags...); err != nil {
+				affectedReleases.Failed = append(affectedReleases.Failed, &release)
+				return err
+			} else {
+				affectedReleases.Deleted = append(affectedReleases.Deleted, &release)
+				return nil
+			}
 		}
 		return nil
 	})
@@ -826,11 +875,11 @@ func (st *HelmState) Clean() []error {
 }
 
 // FilterReleases allows for the execution of helm commands against a subset of the releases in the helmfile.
-func (st *HelmState) FilterReleases(labels []string) error {
+func (st *HelmState) FilterReleases() error {
 	var filteredReleases []ReleaseSpec
 	releaseSet := map[string][]ReleaseSpec{}
 	filters := []ReleaseFilter{}
-	for _, label := range labels {
+	for _, label := range st.Selectors {
 		f, err := ParseLabels(label)
 		if err != nil {
 			return err
@@ -862,7 +911,7 @@ func (st *HelmState) FilterReleases(labels []string) error {
 	}
 	st.Releases = filteredReleases
 	numFound := len(filteredReleases)
-	st.logger.Debugf("%d release(s) matching %s found in %s\n", numFound, strings.Join(labels, ","), st.FilePath)
+	st.logger.Debugf("%d release(s) matching %s found in %s\n", numFound, strings.Join(st.Selectors, ","), st.FilePath)
 	return nil
 }
 
@@ -1312,8 +1361,75 @@ func (st *HelmState) namespaceAndValuesFlags(helm helmexec.Interface, release *R
 	return flags, nil
 }
 
+// DisplayAffectedReleases logs the upgraded, deleted and in error releases
+func (ar *AffectedReleases) DisplayAffectedReleases(logger *zap.SugaredLogger) {
+	if ar.Upgraded != nil {
+		logger.Info("\nList of updated releases :")
+		tbl, _ := prettytable.NewTable(prettytable.Column{Header: "RELEASE"},
+			prettytable.Column{Header: "CHART", MinWidth: 6},
+			prettytable.Column{Header: "VERSION", AlignRight: true},
+		)
+		tbl.Separator = "   "
+		for _, release := range ar.Upgraded {
+			tbl.AddRow(release.Name, release.Chart, release.installedVersion)
+		}
+		tbl.Print()
+	}
+	if ar.Deleted != nil {
+		logger.Info("\nList of deleted releases :")
+		logger.Info("RELEASE")
+		for _, release := range ar.Deleted {
+			logger.Info(release.Name)
+		}
+	}
+	if ar.Failed != nil {
+		logger.Info("\nList of releases in error :")
+		logger.Info("RELEASE")
+		for _, release := range ar.Failed {
+			logger.Info(release.Name)
+		}
+	}
+}
+
 func escape(value string) string {
 	intermediate := strings.Replace(value, "{", "\\{", -1)
 	intermediate = strings.Replace(intermediate, "}", "\\}", -1)
 	return strings.Replace(intermediate, ",", "\\,", -1)
+}
+
+//UnmarshalYAML will unmarshal the helmfile yaml section and fill the SubHelmfileSpec structure
+//this is required to keep allowing string scalar for defining helmfile
+func (hf *SubHelmfileSpec) UnmarshalYAML(unmarshal func(interface{}) error) error {
+
+	var tmp interface{}
+	if err := unmarshal(&tmp); err != nil {
+		return err
+	}
+
+	switch i := tmp.(type) {
+	case string: // single path definition without sub items, legacy sub helmfile definition
+		hf.Path = i
+	case map[interface{}]interface{}: // helmfile path with sub section
+		var subHelmfileSpecTmp struct {
+			Path               string   `yaml:"path"`
+			Selectors          []string `yaml:"selectors"`
+			SelectorsInherited bool     `yaml:"selectorsInherited"`
+		}
+		if err := unmarshal(&subHelmfileSpecTmp); err != nil {
+			return err
+		}
+		hf.Path = subHelmfileSpecTmp.Path
+		hf.Selectors = subHelmfileSpecTmp.Selectors
+		hf.SelectorsInherited = subHelmfileSpecTmp.SelectorsInherited
+	}
+	//since we cannot make sur the "console" string can be red after the "path" we must check we don't have
+	//a SubHelmfileSpec with only selector and no path
+	if hf.Selectors != nil && hf.Path == "" {
+		return fmt.Errorf("found 'selectors' definition without path: %v", hf.Selectors)
+	}
+	//also exclude SelectorsInherited to true and explicit selectors
+	if hf.SelectorsInherited && len(hf.Selectors) > 0 {
+		return fmt.Errorf("You cannot use 'SelectorsInherited: true' along with and explicit selector for path: %v", hf.Path)
+	}
+	return nil
 }

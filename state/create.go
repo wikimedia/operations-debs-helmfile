@@ -3,16 +3,17 @@ package state
 import (
 	"bytes"
 	"fmt"
+	"io"
+	"io/ioutil"
+	"os"
+	"path/filepath"
+
 	"github.com/imdario/mergo"
 	"github.com/roboll/helmfile/environment"
 	"github.com/roboll/helmfile/helmexec"
 	"github.com/roboll/helmfile/tmpl"
 	"go.uber.org/zap"
 	"gopkg.in/yaml.v2"
-	"io"
-	"io/ioutil"
-	"os"
-	"path/filepath"
 )
 
 type StateLoadError struct {
@@ -158,7 +159,15 @@ func (st *HelmState) loadEnv(name string, readFile func(string) ([]byte, error))
 				if _, err := os.Stat(path); os.IsNotExist(err) {
 					return nil, err
 				}
-				release := &st.Releases[0]
+				// Work-around to allow decrypting environment secrets
+				//
+				// We don't have releases loaded yet and therefore unable to decide whether
+				// helmfile should use helm-tiller to call helm-secrets or not.
+				//
+				// This means that, when you use environment secrets + tillerless setup, you still need a tiller
+				// installed on the cluster, just for decrypting secrets!
+				// Related: https://github.com/futuresimple/helm-secrets/issues/83
+				release := &ReleaseSpec{}
 				flags := st.appendTillerFlags([]string{}, release)
 				decFile, err := helm.DecryptSecret(st.createHelmContext(release, 0), path, flags...)
 				if err != nil {
