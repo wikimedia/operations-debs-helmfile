@@ -1,7 +1,9 @@
 package state
 
 import (
+	"io/ioutil"
 	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 
@@ -13,6 +15,13 @@ import (
 )
 
 var logger = helmexec.NewLogger(os.Stdout, "warn")
+
+func injectFs(st *HelmState, fs *TestFs) *HelmState {
+	st.glob = fs.Glob
+	st.readFile = fs.ReadFile
+	st.fileExists = fs.FileExists
+	return st
+}
 
 func TestLabelParsing(t *testing.T) {
 	cases := []struct {
@@ -113,7 +122,8 @@ func TestHelmState_applyDefaultsTo(t *testing.T) {
 			want: specWithNamespaceFromFields,
 		},
 	}
-	for _, tt := range tests {
+	for i := range tests {
+		tt := tests[i]
 		t.Run(tt.name, func(t *testing.T) {
 			state := &HelmState{
 				basePath:           tt.fields.BaseChartPath,
@@ -503,7 +513,8 @@ func TestHelmState_flagsForUpgrade(t *testing.T) {
 			},
 		},
 	}
-	for _, tt := range tests {
+	for i := range tests {
+		tt := tests[i]
 		t.Run(tt.name, func(t *testing.T) {
 			state := &HelmState{
 				basePath:          "./",
@@ -551,7 +562,7 @@ func Test_isLocalChart(t *testing.T) {
 			args: args{
 				chart: "",
 			},
-			want: false,
+			want: true,
 		},
 		{
 			name: "parent local path",
@@ -567,11 +578,26 @@ func Test_isLocalChart(t *testing.T) {
 			},
 			want: true,
 		},
+		{
+			name: "absolute path",
+			args: args{
+				chart: "/foo/bar/baz",
+			},
+			want: true,
+		},
+		{
+			name: "local chart in 3-level deep dir",
+			args: args{
+				chart: "foo/bar/baz",
+			},
+			want: true,
+		},
 	}
-	for _, tt := range tests {
+	for i := range tests {
+		tt := tests[i]
 		t.Run(tt.name, func(t *testing.T) {
 			if got := isLocalChart(tt.args.chart); got != tt.want {
-				t.Errorf("pathExists() = %v, want %v", got, tt.want)
+				t.Errorf("%s(\"%s\") isLocalChart(): got %v, want %v", tt.name, tt.args.chart, got, tt.want)
 			}
 		})
 	}
@@ -620,7 +646,8 @@ func Test_normalizeChart(t *testing.T) {
 			want: "/app",
 		},
 	}
-	for _, tt := range tests {
+	for i := range tests {
+		tt := tests[i]
 		t.Run(tt.name, func(t *testing.T) {
 			if got := normalizeChart(tt.args.basePath, tt.args.chart); got != tt.want {
 				t.Errorf("normalizeChart() = %v, want %v", got, tt.want)
@@ -643,6 +670,8 @@ type mockHelmExec struct {
 	deleted  []mockRelease
 	lists    map[listKey]string
 	diffed   []mockRelease
+
+	updateDepsCallbacks map[string]func(string) error
 }
 
 type mockRelease struct {
@@ -658,9 +687,18 @@ type mockAffected struct {
 
 func (helm *mockHelmExec) UpdateDeps(chart string) error {
 	if strings.Contains(chart, "error") {
-		return errors.New("error")
+		return fmt.Errorf("simulated UpdateDeps failure for chart: %s", chart)
 	}
 	helm.charts = append(helm.charts, chart)
+
+	if helm.updateDepsCallbacks != nil {
+		callback, exists := helm.updateDepsCallbacks[chart]
+		if exists {
+			if err := callback(chart); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 
@@ -787,7 +825,8 @@ func TestHelmState_SyncRepos(t *testing.T) {
 			want: []string{"name", "http://example.com/", "", "", "example_user", "example_password"},
 		},
 	}
-	for _, tt := range tests {
+	for i := range tests {
+		tt := tests[i]
 		t.Run(tt.name, func(t *testing.T) {
 			for k, v := range tt.envs {
 				err := os.Setenv(k, v)
@@ -902,7 +941,8 @@ func TestHelmState_SyncReleases(t *testing.T) {
 			wantReleases: []mockRelease{{"releaseName", []string{"--set", "foo.bar[0]={A,B}"}}},
 		},
 	}
-	for _, tt := range tests {
+	for i := range tests {
+		tt := tests[i]
 		t.Run(tt.name, func(t *testing.T) {
 			state := &HelmState{
 				Releases: tt.releases,
@@ -911,6 +951,117 @@ func TestHelmState_SyncReleases(t *testing.T) {
 			if _ = state.SyncReleases(&AffectedReleases{}, tt.helm, []string{}, 1); !reflect.DeepEqual(tt.helm.releases, tt.wantReleases) {
 				t.Errorf("HelmState.SyncReleases() for [%s] = %v, want %v", tt.name, tt.helm.releases, tt.wantReleases)
 			}
+		})
+	}
+}
+
+func TestHelmState_SyncReleases_MissingValuesFileForUndesiredRelease(t *testing.T) {
+	no := false
+	tests := []struct {
+		name          string
+		release       ReleaseSpec
+		listResult    string
+		expectedError string
+	}{
+		{
+			name: "should install",
+			release: ReleaseSpec{
+				Name:  "foo",
+				Chart: "../../foo-bar",
+			},
+			listResult:    ``,
+			expectedError: ``,
+		},
+		{
+			name: "should upgrade",
+			release: ReleaseSpec{
+				Name:  "foo",
+				Chart: "../../foo-bar",
+			},
+			listResult: `NAME 	REVISION	UPDATED                 	STATUS  	CHART                      	APP VERSION	NAMESPACE
+										foo	1       	Wed Apr 17 17:39:04 2019	DEPLOYED	foo-bar-2.0.4	0.1.0      	default`,
+			expectedError: ``,
+		},
+		{
+			name: "should uninstall",
+			release: ReleaseSpec{
+				Name:      "foo",
+				Chart:     "../../foo-bar",
+				Installed: &no,
+			},
+			listResult: `NAME 	REVISION	UPDATED                 	STATUS  	CHART                      	APP VERSION	NAMESPACE
+										foo	1       	Wed Apr 17 17:39:04 2019	DEPLOYED	foo-bar-2.0.4	0.1.0      	default`,
+			expectedError: ``,
+		},
+		{
+			name: "should fail installing due to missing values file",
+			release: ReleaseSpec{
+				Name:   "foo",
+				Chart:  "../../foo-bar",
+				Values: []interface{}{"noexistent.values.yaml"},
+			},
+			listResult:    ``,
+			expectedError: `failed processing release foo: values file matching "noexistent.values.yaml" does not exist`,
+		},
+		{
+			name: "should fail upgrading due to missing values file",
+			release: ReleaseSpec{
+				Name:   "foo",
+				Chart:  "../../foo-bar",
+				Values: []interface{}{"noexistent.values.yaml"},
+			},
+			listResult: `NAME 	REVISION	UPDATED                 	STATUS  	CHART                      	APP VERSION	NAMESPACE
+										foo	1       	Wed Apr 17 17:39:04 2019	DEPLOYED	foo-bar-2.0.4	0.1.0      	default`,
+			expectedError: `failed processing release foo: values file matching "noexistent.values.yaml" does not exist`,
+		},
+		{
+			name: "should uninstall even when there is a missing values file",
+			release: ReleaseSpec{
+				Name:      "foo",
+				Chart:     "../../foo-bar",
+				Values:    []interface{}{"noexistent.values.yaml"},
+				Installed: &no,
+			},
+			listResult: `NAME 	REVISION	UPDATED                 	STATUS  	CHART                      	APP VERSION	NAMESPACE
+										foo	1       	Wed Apr 17 17:39:04 2019	DEPLOYED	foo-bar-2.0.4	0.1.0      	default`,
+			expectedError: ``,
+		},
+	}
+	for i := range tests {
+		tt := tests[i]
+		t.Run(tt.name, func(t *testing.T) {
+			state := &HelmState{
+				Releases: []ReleaseSpec{tt.release},
+				logger:   logger,
+			}
+			fs := NewTestFs(map[string]string{})
+			state = injectFs(state, fs)
+			helm := &mockHelmExec{
+				lists: map[listKey]string{},
+			}
+			//simulate the helm.list call result
+			helm.lists[listKey{filter: "^" + tt.release.Name + "$"}] = tt.listResult
+
+			affectedReleases := AffectedReleases{}
+			errs := state.SyncReleases(&affectedReleases, helm, []string{}, 1)
+
+			if tt.expectedError != "" {
+				if len(errs) == 0 {
+					t.Fatalf("expected error not occurred: expected=%s, got none", tt.expectedError)
+				}
+				if len(errs) != 1 {
+					t.Fatalf("too many errors: expected %d, got %d: %v", 1, len(errs), errs)
+				}
+				err := errs[0]
+				if err.Error() != tt.expectedError {
+					t.Fatalf("unexpected error: expected=%s, got=%v", tt.expectedError, err)
+				}
+			} else {
+				if len(errs) > 0 {
+					t.Fatalf("unexpected error(s): expected=0, got=%d: %v", len(errs), errs)
+				}
+			}
+
 		})
 	}
 }
@@ -989,7 +1140,8 @@ func TestHelmState_SyncReleasesAffectedRealeases(t *testing.T) {
 			wantAffected: mockAffected{[]*mockRelease{{"releaseNameFoo", []string{}}}, []*mockRelease{{"releaseNameBar", []string{}}}, []*mockRelease{{"releaseNameFoo-error", []string{}}}},
 		},
 	}
-	for _, tt := range tests {
+	for i := range tests {
+		tt := tests[i]
 		t.Run(tt.name, func(t *testing.T) {
 			state := &HelmState{
 				Releases: tt.releases,
@@ -1079,7 +1231,8 @@ func TestGetDeployedVersion(t *testing.T) {
 			installedVersion: "1.0.0-alpha+001",
 		},
 	}
-	for _, tt := range tests {
+	for i := range tests {
+		tt := tests[i]
 		t.Run(tt.name, func(t *testing.T) {
 			state := &HelmState{
 				Releases: []ReleaseSpec{tt.release},
@@ -1198,7 +1351,8 @@ func TestHelmState_DiffReleases(t *testing.T) {
 			wantReleases: []mockRelease{{"releaseName", []string{"--set", "foo.bar[0]={A,B}"}}},
 		},
 	}
-	for _, tt := range tests {
+	for i := range tests {
+		tt := tests[i]
 		t.Run(tt.name, func(t *testing.T) {
 			state := &HelmState{
 				Releases: tt.releases,
@@ -1267,28 +1421,22 @@ func TestHelmState_SyncReleasesCleanup(t *testing.T) {
 			expectedNumRemovedFiles: 2,
 		},
 	}
-	for _, tt := range tests {
+	for i := range tests {
+		tt := tests[i]
 		t.Run(tt.name, func(t *testing.T) {
 			numRemovedFiles := 0
 			state := &HelmState{
 				Releases: tt.releases,
 				logger:   logger,
-				readFile: func(f string) ([]byte, error) {
-					if f != "someFile" {
-						return nil, fmt.Errorf("unexpected file to read: %s", f)
-					}
-					someFileContent := []byte(`foo: bar
-`)
-					return someFileContent, nil
-				},
 				removeFile: func(f string) error {
 					numRemovedFiles += 1
 					return nil
 				},
-				fileExists: func(f string) (bool, error) {
-					return true, nil
-				},
 			}
+			testfs := NewTestFs(map[string]string{
+				"/path/to/someFile": `foo: FOO`,
+			})
+			state = injectFs(state, testfs)
 			if errs := state.SyncReleases(&AffectedReleases{}, tt.helm, []string{}, 1); errs != nil && len(errs) > 0 {
 				t.Errorf("unexpected errors: %v", errs)
 			}
@@ -1356,28 +1504,23 @@ func TestHelmState_DiffReleasesCleanup(t *testing.T) {
 			expectedNumRemovedFiles: 2,
 		},
 	}
-	for _, tt := range tests {
+	for i := range tests {
+		tt := tests[i]
 		t.Run(tt.name, func(t *testing.T) {
 			numRemovedFiles := 0
 			state := &HelmState{
 				Releases: tt.releases,
 				logger:   logger,
-				readFile: func(f string) ([]byte, error) {
-					if f != "someFile" {
-						return nil, fmt.Errorf("unexpected file to read: %s", f)
-					}
-					someFileContent := []byte(`foo: bar
-`)
-					return someFileContent, nil
-				},
 				removeFile: func(f string) error {
 					numRemovedFiles += 1
 					return nil
 				},
-				fileExists: func(f string) (bool, error) {
-					return true, nil
-				},
 			}
+			testfs := NewTestFs(map[string]string{
+				"/path/to/someFile": `foo: bar
+`,
+			})
+			state = injectFs(state, testfs)
 			if _, errs := state.DiffReleases(tt.helm, []string{}, 1, false, false, false); errs != nil && len(errs) > 0 {
 				t.Errorf("unexpected errors: %v", errs)
 			}
@@ -1394,8 +1537,39 @@ func TestHelmState_DiffReleasesCleanup(t *testing.T) {
 }
 
 func TestHelmState_UpdateDeps(t *testing.T) {
+	helm := &mockHelmExec{
+		updateDepsCallbacks: map[string]func(string) error{},
+	}
+
+	var generatedDir string
+	tempDir := func(dir, prefix string) (string, error) {
+		var err error
+		generatedDir, err = ioutil.TempDir(dir, prefix)
+		if err != nil {
+			return "", err
+		}
+		helm.updateDepsCallbacks[generatedDir] = func(chart string) error {
+			content := []byte(`dependencies:
+- name: envoy
+  repository: https://kubernetes-charts.storage.googleapis.com
+  version: 1.5.0
+- name: envoy
+  repository: https://kubernetes-charts.storage.googleapis.com
+  version: 1.4.0
+digest: sha256:8194b597c85bb3d1fee8476d4a486e952681d5c65f185ad5809f2118bc4079b5
+generated: 2019-05-16T15:42:45.50486+09:00
+`)
+			filename := filepath.Join(generatedDir, "requirements.lock")
+			logger.Debugf("test: writing %s: %s", filename, content)
+			return ioutil.WriteFile(filename, content, 0644)
+		}
+		return generatedDir, nil
+	}
+
+	logger := helmexec.NewLogger(os.Stderr, "debug")
 	state := &HelmState{
 		basePath: "/src",
+		FilePath: "/src/helmfile.yaml",
 		Releases: []ReleaseSpec{
 			{
 				Chart: "./..",
@@ -1413,19 +1587,89 @@ func TestHelmState_UpdateDeps(t *testing.T) {
 				Chart: "published/deeper",
 			},
 			{
-				Chart: ".error",
+				Chart:   "stable/envoy",
+				Version: "1.5.0",
+			},
+			{
+				Chart:   "stable/envoy",
+				Version: "1.4.0",
 			},
 		},
+		Repositories: []RepositorySpec{
+			{
+				Name: "stable",
+				URL:  "https://kubernetes-charts.storage.googleapis.com",
+			},
+		},
+		tempDir: tempDir,
+		logger:  logger,
 	}
 
-	want := []string{"/", "/examples", "/helmfile"}
-	helm := &mockHelmExec{}
 	errs := state.UpdateDeps(helm)
+	want := []string{"/", "/examples", "/helmfile", "/src/published", generatedDir}
 	if !reflect.DeepEqual(helm.charts, want) {
 		t.Errorf("HelmState.UpdateDeps() = %v, want %v", helm.charts, want)
 	}
 	if len(errs) != 0 {
-		t.Errorf("HelmState.UpdateDeps() - no errors, but got: %v", len(errs))
+		t.Errorf("HelmState.UpdateDeps() - no errors, but got %d: %v", len(errs), errs)
+	}
+
+	resolved, err := state.ResolveDeps()
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+
+	if resolved.Releases[5].Version != "1.5.0" {
+		t.Errorf("unexpected version number: expected=1.5.0, got=%s", resolved.Releases[5].Version)
+	}
+	if resolved.Releases[6].Version != "1.4.0" {
+		t.Errorf("unexpected version number: expected=1.4.0, got=%s", resolved.Releases[6].Version)
+	}
+}
+
+func TestHelmState_ResolveDeps_NoLockFile(t *testing.T) {
+	logger := helmexec.NewLogger(os.Stderr, "debug")
+	state := &HelmState{
+		basePath: "/src",
+		FilePath: "/src/helmfile.yaml",
+		Releases: []ReleaseSpec{
+			{
+				Chart: "./..",
+			},
+			{
+				Chart: "../examples",
+			},
+			{
+				Chart: "../../helmfile",
+			},
+			{
+				Chart: "published",
+			},
+			{
+				Chart: "published/deeper",
+			},
+			{
+				Chart: "stable/envoy",
+			},
+		},
+		Repositories: []RepositorySpec{
+			{
+				Name: "stable",
+				URL:  "https://kubernetes-charts.storage.googleapis.com",
+			},
+		},
+		logger: logger,
+		readFile: func(f string) ([]byte, error) {
+			if f != "helmfile.lock" {
+				return nil, fmt.Errorf("stub: unexpected file: %s", f)
+			}
+			return nil, os.ErrNotExist
+		},
+	}
+
+	_, err := state.ResolveDeps()
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
 	}
 }
 
@@ -1496,8 +1740,9 @@ func TestHelmState_ReleaseStatuses(t *testing.T) {
 			want: []mockRelease{{"releaseA", []string{"--tiller-namespace", "tillerns"}}},
 		},
 	}
-	for _, tt := range tests {
-		i := func(t *testing.T) {
+	for i := range tests {
+		tt := tests[i]
+		f := func(t *testing.T) {
 			state := &HelmState{
 				Releases: tt.releases,
 				logger:   logger,
@@ -1523,7 +1768,7 @@ func TestHelmState_ReleaseStatuses(t *testing.T) {
 				t.Errorf("HelmState.ReleaseStatuses() for [%s] = %v, want %v", tt.name, tt.helm.releases, tt.want)
 			}
 		}
-		t.Run(tt.name, i)
+		t.Run(tt.name, f)
 	}
 }
 
@@ -1580,8 +1825,9 @@ func TestHelmState_TestReleasesNoCleanUp(t *testing.T) {
 			want: []mockRelease{{"releaseA", []string{"--timeout", "1", "--tiller-namespace", "tillerns"}}},
 		},
 	}
-	for _, tt := range tests {
-		i := func(t *testing.T) {
+	for i := range tests {
+		tt := tests[i]
+		f := func(t *testing.T) {
 			state := &HelmState{
 				Releases: tt.releases,
 				logger:   logger,
@@ -1595,7 +1841,7 @@ func TestHelmState_TestReleasesNoCleanUp(t *testing.T) {
 				t.Errorf("HelmState.TestReleases() for [%s] = %v, want %v", tt.name, tt.helm.releases, tt.want)
 			}
 		}
-		t.Run(tt.name, i)
+		t.Run(tt.name, f)
 	}
 }
 
@@ -1630,8 +1876,9 @@ func TestHelmState_NoReleaseMatched(t *testing.T) {
 			wantErr: false,
 		},
 	}
-	for _, tt := range tests {
-		i := func(t *testing.T) {
+	for i := range tests {
+		tt := tests[i]
+		f := func(t *testing.T) {
 			state := &HelmState{
 				Releases: releases,
 				logger:   logger,
@@ -1643,7 +1890,7 @@ func TestHelmState_NoReleaseMatched(t *testing.T) {
 				return
 			}
 		}
-		t.Run(tt.name, i)
+		t.Run(tt.name, f)
 	}
 }
 
@@ -1749,8 +1996,9 @@ func TestHelmState_Delete(t *testing.T) {
 			deleted:         []mockRelease{{"releaseA", []string{"--purge", "--tiller-namespace", "tillerns"}}},
 		},
 	}
-	for _, tt := range tests {
-		i := func(t *testing.T) {
+	for i := range tests {
+		tt := tests[i]
+		f := func(t *testing.T) {
 			name := "releaseA"
 			if tt.wantErr {
 				name = "releaseA-error"
@@ -1785,6 +2033,6 @@ func TestHelmState_Delete(t *testing.T) {
 				t.Errorf("unexpected deletions happened: expected %v, got %v", &affectedReleases.Deleted, tt.deleted)
 			}
 		}
-		t.Run(tt.name, i)
+		t.Run(tt.name, f)
 	}
 }
