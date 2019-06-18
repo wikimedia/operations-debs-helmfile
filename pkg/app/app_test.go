@@ -2,11 +2,9 @@ package app
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"reflect"
-	"strings"
 	"testing"
 
 	"github.com/roboll/helmfile/helmexec"
@@ -14,112 +12,208 @@ import (
 	"gotest.tools/env"
 )
 
-type testFs struct {
-	wd    string
-	dirs  map[string]bool
-	files map[string]string
-}
-
 func appWithFs(app *App, files map[string]string) *App {
-	fs := newTestFs(files)
+	fs := state.NewTestFs(files)
 	return injectFs(app, fs)
 }
 
-func injectFs(app *App, fs *testFs) *App {
-	app.readFile = fs.readFile
-	app.glob = fs.glob
-	app.abs = fs.abs
-	app.getwd = fs.getwd
-	app.chdir = fs.chdir
-	app.fileExistsAt = fs.fileExistsAt
-	app.directoryExistsAt = fs.directoryExistsAt
+func injectFs(app *App, fs *state.TestFs) *App {
+	app.readFile = fs.ReadFile
+	app.glob = fs.Glob
+	app.abs = fs.Abs
+	app.getwd = fs.Getwd
+	app.chdir = fs.Chdir
+	app.fileExistsAt = fs.FileExistsAt
+	app.fileExists = fs.FileExists
+	app.directoryExistsAt = fs.DirectoryExistsAt
 	return app
 }
 
-func newTestFs(files map[string]string) *testFs {
-	dirs := map[string]bool{}
-	for abs, _ := range files {
-		d := filepath.Dir(abs)
-		dirs[d] = true
+func TestVisitDesiredStatesWithReleasesFiltered_ReleaseOrder(t *testing.T) {
+	files := map[string]string{
+		"/path/to/helmfile.yaml": `
+helmfiles:
+- helmfile.d/a*.yaml
+- helmfile.d/b*.yaml
+`,
+		"/path/to/helmfile.d/a1.yaml": `
+releases:
+- name: zipkin
+  chart: stable/zipkin
+`,
+		"/path/to/helmfile.d/a2.yaml": `
+releases:
+- name: prometheus
+  chart: stable/prometheus
+`,
+		"/path/to/helmfile.d/b.yaml": `
+releases:
+- name: grafana
+  chart: stable/grafana
+`,
 	}
-	return &testFs{
-		wd:    "/path/to",
-		dirs:  dirs,
-		files: files,
+	fs := state.NewTestFs(files)
+	fs.GlobFixtures["/path/to/helmfile.d/a*.yaml"] = []string{"/path/to/helmfile.d/a2.yaml", "/path/to/helmfile.d/a1.yaml"}
+	app := &App{
+		KubeContext: "default",
+		Logger:      helmexec.NewLogger(os.Stderr, "debug"),
+		Namespace:   "",
+		Env:         "default",
+	}
+	app = injectFs(app, fs)
+	actualOrder := []string{}
+	noop := func(st *state.HelmState, helm helmexec.Interface) []error {
+		actualOrder = append(actualOrder, st.FilePath)
+		return []error{}
+	}
+
+	err := app.VisitDesiredStatesWithReleasesFiltered(
+		"helmfile.yaml", noop,
+	)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+
+	expectedOrder := []string{"a1.yaml", "a2.yaml", "b.yaml", "helmfile.yaml"}
+	if !reflect.DeepEqual(actualOrder, expectedOrder) {
+		t.Errorf("unexpected order of processed state files: expected=%v, actual=%v", expectedOrder, actualOrder)
 	}
 }
 
-func (f *testFs) fileExistsAt(path string) bool {
-	var ok bool
-	if strings.Contains(path, "/") {
-		_, ok = f.files[path]
-	} else {
-		_, ok = f.files[filepath.Join(f.wd, path)]
+func TestVisitDesiredStatesWithReleasesFiltered_EnvValuesFileOrder(t *testing.T) {
+	files := map[string]string{
+		"/path/to/helmfile.yaml": `
+environments:
+  default:
+    values:
+    - env.*.yaml
+releases:
+- name: zipkin
+  chart: stable/zipkin
+`,
+		"/path/to/env.1.yaml": `FOO: 1
+BAR: 2
+`,
+		"/path/to/env.2.yaml": `BAR: 3
+BAZ: 4
+`,
 	}
-	return ok
+	fs := state.NewTestFs(files)
+	fs.GlobFixtures["/path/to/env.*.yaml"] = []string{"/path/to/env.2.yaml", "/path/to/env.1.yaml"}
+	app := &App{
+		KubeContext: "default",
+		Logger:      helmexec.NewLogger(os.Stderr, "debug"),
+		Namespace:   "",
+		Env:         "default",
+	}
+	app = injectFs(app, fs)
+	noop := func(st *state.HelmState, helm helmexec.Interface) []error {
+		return []error{}
+	}
+
+	err := app.VisitDesiredStatesWithReleasesFiltered(
+		"helmfile.yaml", noop,
+	)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+
+	expectedOrder := []string{"helmfile.yaml", "/path/to/env.1.yaml", "/path/to/env.2.yaml", "/path/to/env.1.yaml", "/path/to/env.2.yaml"}
+	actualOrder := fs.SuccessfulReads()
+	if !reflect.DeepEqual(actualOrder, expectedOrder) {
+		t.Errorf("unexpected order of processed state files: expected=%v, actual=%v", expectedOrder, actualOrder)
+	}
 }
 
-func (f *testFs) directoryExistsAt(path string) bool {
-	var ok bool
-	if strings.Contains(path, "/") {
-		_, ok = f.dirs[path]
-	} else {
-		_, ok = f.dirs[filepath.Join(f.wd, path)]
+func TestVisitDesiredStatesWithReleasesFiltered_MissingEnvValuesFile(t *testing.T) {
+	files := map[string]string{
+		"/path/to/helmfile.yaml": `
+environments:
+  default:
+    values:
+    - env.*.yaml
+releases:
+- name: zipkin
+  chart: stable/zipkin
+`,
 	}
-	return ok
+	fs := state.NewTestFs(files)
+	app := &App{
+		KubeContext: "default",
+		Logger:      helmexec.NewLogger(os.Stderr, "debug"),
+		Namespace:   "",
+		Env:         "default",
+	}
+	app = injectFs(app, fs)
+	noop := func(st *state.HelmState, helm helmexec.Interface) []error {
+		return []error{}
+	}
+
+	err := app.VisitDesiredStatesWithReleasesFiltered(
+		"helmfile.yaml", noop,
+	)
+	if err == nil {
+		t.Fatal("expected error did not occur")
+	}
+
+	expected := "in ./helmfile.yaml: failed to read helmfile.yaml: environment values file matching \"env.*.yaml\" does not exist"
+	if err.Error() != expected {
+		t.Errorf("unexpected error: expected=%s, got=%v", expected, err)
+	}
 }
 
-func (f *testFs) readFile(filename string) ([]byte, error) {
-	var str string
-	var ok bool
-	if strings.Contains(filename, "/") {
-		str, ok = f.files[filename]
-	} else {
-		str, ok = f.files[filepath.Join(f.wd, filename)]
+func TestVisitDesiredStatesWithReleasesFiltered_MissingEnvValuesFileHandler(t *testing.T) {
+	testcases := []struct {
+		name        string
+		handler     string
+		filePattern string
+		expectErr   bool
+	}{
+		{name: "error handler with no files matching glob", handler: "Error", filePattern: "env.*.yaml", expectErr: true},
+		{name: "warn handler with no files matching glob", handler: "Warn", filePattern: "env.*.yaml", expectErr: false},
+		{name: "info handler with no files matching glob", handler: "Info", filePattern: "env.*.yaml", expectErr: false},
+		{name: "debug handler with no files matching glob", handler: "Debug", filePattern: "env.*.yaml", expectErr: false},
 	}
-	if !ok {
-		return []byte(nil), fmt.Errorf("no file found: %s", filename)
-	}
-	return []byte(str), nil
-}
 
-func (f *testFs) glob(pattern string) ([]string, error) {
-	matches := []string{}
-	for name, _ := range f.files {
-		matched, err := filepath.Match(pattern, name)
-		if err != nil {
-			return nil, err
-		}
-		if matched {
-			matches = append(matches, name)
-		}
-	}
-	if len(matches) == 0 {
-		return []string(nil), fmt.Errorf("no file matched: %s", pattern)
-	}
-	return matches, nil
-}
+	for i := range testcases {
+		testcase := testcases[i]
+		t.Run(testcase.name, func(t *testing.T) {
+			files := map[string]string{
+				"/path/to/helmfile.yaml": fmt.Sprintf(`
+environments:
+  default:
+    missingFileHandler: %s
+    values:
+    - %s
+releases:
+- name: zipkin
+  chart: stable/zipkin
+`, testcase.handler, testcase.filePattern),
+			}
+			fs := state.NewTestFs(files)
+			app := &App{
+				KubeContext: "default",
+				Logger:      helmexec.NewLogger(os.Stderr, "debug"),
+				Namespace:   "",
+				Env:         "default",
+			}
+			app = injectFs(app, fs)
+			noop := func(st *state.HelmState, helm helmexec.Interface) []error {
+				return []error{}
+			}
 
-func (f *testFs) abs(path string) (string, error) {
-	var p string
-	if path[0] == '/' {
-		p = path
-	} else {
-		p = filepath.Join(f.wd, path)
-	}
-	return filepath.Clean(p), nil
-}
+			err := app.VisitDesiredStatesWithReleasesFiltered(
+				"helmfile.yaml", noop,
+			)
+			if testcase.expectErr && err == nil {
+				t.Fatal("expected error did not occur")
+			}
 
-func (f *testFs) getwd() (string, error) {
-	return f.wd, nil
-}
-
-func (f *testFs) chdir(dir string) error {
-	if dir == "/path/to" || dir == "/path/to/helmfile.d" {
-		f.wd = dir
-		return nil
+			if !testcase.expectErr && err != nil {
+				t.Errorf("not error expected, but got: %v", err)
+			}
+		})
 	}
-	return fmt.Errorf("unexpected chdir \"%s\"", dir)
 }
 
 // See https://github.com/roboll/helmfile/issues/193
@@ -146,10 +240,6 @@ releases:
   chart: stable/grafana
 `,
 	}
-	noop := func(st *state.HelmState, helm helmexec.Interface) []error {
-		return []error{}
-	}
-
 	testcases := []struct {
 		name      string
 		expectErr bool
@@ -161,13 +251,20 @@ releases:
 	}
 
 	for _, testcase := range testcases {
-		app := appWithFs(&App{
+		fs := state.NewTestFs(files)
+		fs.GlobFixtures["/path/to/helmfile.d/a*.yaml"] = []string{"/path/to/helmfile.d/a2.yaml", "/path/to/helmfile.d/a1.yaml"}
+		app := &App{
 			KubeContext: "default",
 			Logger:      helmexec.NewLogger(os.Stderr, "debug"),
 			Selectors:   []string{fmt.Sprintf("name=%s", testcase.name)},
 			Namespace:   "",
 			Env:         "default",
-		}, files)
+		}
+		app = injectFs(app, fs)
+		noop := func(st *state.HelmState, helm helmexec.Interface) []error {
+			return []error{}
+		}
+
 		err := app.VisitDesiredStatesWithReleasesFiltered(
 			"helmfile.yaml", noop,
 		)
@@ -282,11 +379,11 @@ releases:
 		errMsg        string
 	}{
 		{label: "name=prometheus", expectedCount: 1, expectErr: false},
-		{label: "name=", expectedCount: 0, expectErr: true, errMsg: "failed processing /path/to/helmfile.d/a1.yaml: Malformed label: name=. Expected label in form k=v or k!=v"},
-		{label: "name!=", expectedCount: 0, expectErr: true, errMsg: "failed processing /path/to/helmfile.d/a1.yaml: Malformed label: name!=. Expected label in form k=v or k!=v"},
-		{label: "name", expectedCount: 0, expectErr: true, errMsg: "failed processing /path/to/helmfile.d/a1.yaml: Malformed label: name. Expected label in form k=v or k!=v"},
+		{label: "name=", expectedCount: 0, expectErr: true, errMsg: "in ./helmfile.yaml: in .helmfiles[0]: in /path/to/helmfile.d/a1.yaml: Malformed label: name=. Expected label in form k=v or k!=v"},
+		{label: "name!=", expectedCount: 0, expectErr: true, errMsg: "in ./helmfile.yaml: in .helmfiles[0]: in /path/to/helmfile.d/a1.yaml: Malformed label: name!=. Expected label in form k=v or k!=v"},
+		{label: "name", expectedCount: 0, expectErr: true, errMsg: "in ./helmfile.yaml: in .helmfiles[0]: in /path/to/helmfile.d/a1.yaml: Malformed label: name. Expected label in form k=v or k!=v"},
 		// See https://github.com/roboll/helmfile/issues/193
-		{label: "duplicated=yes", expectedCount: 0, expectErr: true, errMsg: "failed processing /path/to/helmfile.d/b.yaml: duplicate release \"foo\" found in \"zoo\": there were 2 releases named \"foo\" matching specified selector"},
+		{label: "duplicated=yes", expectedCount: 0, expectErr: true, errMsg: "in ./helmfile.yaml: in .helmfiles[2]: in /path/to/helmfile.d/b.yaml: duplicate release \"foo\" found in \"zoo\": there were 2 releases named \"foo\" matching specified selector"},
 		{label: "duplicatedOK=yes", expectedCount: 2, expectErr: false},
 	}
 
@@ -640,15 +737,400 @@ func TestLoadDesiredStateFromYaml_DuplicateReleaseName(t *testing.T) {
   labels:
     stage: post
 `)
+	readFile := func(filename string) ([]byte, error) {
+		if filename != yamlFile {
+			return nil, fmt.Errorf("unexpected filename: %s", filename)
+		}
+		return yamlContent, nil
+	}
 	app := &App{
-		readFile:    ioutil.ReadFile,
+		readFile:    readFile,
 		glob:        filepath.Glob,
 		abs:         filepath.Abs,
 		KubeContext: "default",
+		Env:         "default",
 		Logger:      helmexec.NewLogger(os.Stderr, "debug"),
 	}
-	_, err := app.loadDesiredStateFromYaml(yamlContent, yamlFile, "default", "default")
+	_, err := app.loadDesiredStateFromYaml(yamlFile)
 	if err != nil {
-		t.Error("unexpected error")
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestLoadDesiredStateFromYaml_Bases(t *testing.T) {
+	yamlFile := "/path/to/yaml/file"
+	yamlContent := `bases:
+- ../base.yaml
+- ../base.gotmpl
+
+{{ readFile "templates.yaml" }}
+
+releases:
+- name: myrelease1
+  chart: mychart1
+  labels:
+    stage: pre
+    foo: bar
+- name: myrelease1
+  chart: mychart2
+  labels:
+    stage: post
+  <<: *default
+`
+	testFs := state.NewTestFs(map[string]string{
+		yamlFile: yamlContent,
+		"/path/to/base.yaml": `environments:
+  default:
+    values:
+    - environments/default/1.yaml
+`,
+		"/path/to/yaml/environments/default/1.yaml": `foo: FOO`,
+		"/path/to/base.gotmpl": `environments:
+  default:
+    values:
+    - environments/default/2.yaml
+
+helmDefaults:
+  tillerNamespace: {{ .Environment.Values.tillerNs }}
+`,
+		"/path/to/yaml/environments/default/2.yaml": `tillerNs: TILLER_NS`,
+		"/path/to/yaml/templates.yaml": `templates:
+  default: &default
+    missingFileHandler: Warn
+    values: ["` + "{{`" + `{{.Release.Name}}` + "`}}" + `/values.yaml"]
+`,
+	})
+	app := &App{
+		readFile:     testFs.ReadFile,
+		glob:         testFs.Glob,
+		abs:          testFs.Abs,
+		fileExistsAt: testFs.FileExistsAt,
+		fileExists:   testFs.FileExists,
+		KubeContext:  "default",
+		Env:          "default",
+		Logger:       helmexec.NewLogger(os.Stderr, "debug"),
+	}
+	st, err := app.loadDesiredStateFromYaml(yamlFile)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if st.HelmDefaults.TillerNamespace != "TILLER_NS" {
+		t.Errorf("unexpected helmDefaults.tillerNamespace: expected=TILLER_NS, got=%s", st.HelmDefaults.TillerNamespace)
+	}
+
+	if *st.Releases[1].MissingFileHandler != "Warn" {
+		t.Errorf("unexpected releases[0].missingFileHandler: expected=Warn, got=%s", *st.Releases[1].MissingFileHandler)
+	}
+
+	if st.Releases[1].Values[0] != "{{`{{.Release.Name}}`}}/values.yaml" {
+		t.Errorf("unexpected releases[0].missingFileHandler: expected={{`{{.Release.Name}}`}}/values.yaml, got=%s", st.Releases[1].Values[0])
+	}
+}
+
+func TestLoadDesiredStateFromYaml_MultiPartTemplate(t *testing.T) {
+	yamlFile := "/path/to/yaml/file"
+	yamlContent := `bases:
+- ../base.yaml
+---
+bases:
+- ../base.gotmpl
+---
+helmDefaults:
+  kubeContext: {{ .Environment.Values.foo }}
+---
+releases:
+- name: myrelease0
+  chart: mychart0
+---
+
+{{ readFile "templates.yaml" }}
+
+releases:
+- name: myrelease1
+  chart: mychart1
+  labels:
+    stage: pre
+    foo: bar
+- name: myrelease1
+  chart: mychart2
+  labels:
+    stage: post
+  <<: *default
+`
+	testFs := state.NewTestFs(map[string]string{
+		yamlFile: yamlContent,
+		"/path/to/base.yaml": `environments:
+  default:
+    values:
+    - environments/default/1.yaml
+`,
+		"/path/to/yaml/environments/default/1.yaml": `foo: FOO`,
+		"/path/to/base.gotmpl": `environments:
+  default:
+    values:
+    - environments/default/2.yaml
+
+helmDefaults:
+  tillerNamespace: {{ .Environment.Values.tillerNs }}
+`,
+		"/path/to/yaml/environments/default/2.yaml": `tillerNs: TILLER_NS`,
+		"/path/to/yaml/templates.yaml": `templates:
+  default: &default
+    missingFileHandler: Warn
+    values: ["` + "{{`" + `{{.Release.Name}}` + "`}}" + `/values.yaml"]
+`,
+	})
+	app := &App{
+		readFile:   testFs.ReadFile,
+		fileExists: testFs.FileExists,
+		glob:       testFs.Glob,
+		abs:        testFs.Abs,
+		Env:        "default",
+		Logger:     helmexec.NewLogger(os.Stderr, "debug"),
+	}
+	st, err := app.loadDesiredStateFromYaml(yamlFile)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+
+	if st.HelmDefaults.TillerNamespace != "TILLER_NS" {
+		t.Errorf("unexpected helmDefaults.tillerNamespace: expected=TILLER_NS, got=%s", st.HelmDefaults.TillerNamespace)
+	}
+
+	if st.Releases[0].Name != "myrelease0" {
+		t.Errorf("unexpected releases[0].name: expected=myrelease0, got=%s", st.Releases[0].Name)
+	}
+	if st.Releases[1].Name != "myrelease1" {
+		t.Errorf("unexpected releases[1].name: expected=myrelease1, got=%s", st.Releases[1].Name)
+	}
+	if st.Releases[2].Name != "myrelease1" {
+		t.Errorf("unexpected releases[2].name: expected=myrelease1, got=%s", st.Releases[2].Name)
+	}
+	if st.Releases[2].Values[0] != "{{`{{.Release.Name}}`}}/values.yaml" {
+		t.Errorf("unexpected releases[2].missingFileHandler: expected={{`{{.Release.Name}}`}}/values.yaml, got=%s", st.Releases[1].Values[0])
+	}
+	if *st.Releases[2].MissingFileHandler != "Warn" {
+		t.Errorf("unexpected releases[2].missingFileHandler: expected=Warn, got=%s", *st.Releases[1].MissingFileHandler)
+	}
+
+	if st.Releases[2].Values[0] != "{{`{{.Release.Name}}`}}/values.yaml" {
+		t.Errorf("unexpected releases[2].missingFileHandler: expected={{`{{.Release.Name}}`}}/values.yaml, got=%s", st.Releases[1].Values[0])
+	}
+
+	if st.HelmDefaults.KubeContext != "FOO" {
+		t.Errorf("unexpected helmDefaults.kubeContext: expected=FOO, got=%s", st.HelmDefaults.KubeContext)
+	}
+}
+
+func TestLoadDesiredStateFromYaml_EnvvalsInheritanceToBaseTemplate(t *testing.T) {
+	yamlFile := "/path/to/yaml/file"
+	yamlContent := `bases:
+- ../base.yaml
+---
+bases:
+# "envvals inheritance"
+# base.gotmpl should be able to reference environment values defined in the base.yaml and default/1.yaml
+- ../base.gotmpl
+---
+releases:
+- name: myrelease0
+  chart: mychart0
+`
+	testFs := state.NewTestFs(map[string]string{
+		yamlFile: yamlContent,
+		"/path/to/base.yaml": `environments:
+  default:
+    values:
+    - environments/default/1.yaml
+`,
+		"/path/to/base.gotmpl": `helmDefaults:
+  kubeContext: {{ .Environment.Values.foo }}
+  tillerNamespace: {{ .Environment.Values.tillerNs }}
+`,
+		"/path/to/yaml/environments/default/1.yaml": `tillerNs: TILLER_NS
+foo: FOO
+`,
+		"/path/to/yaml/templates.yaml": `templates:
+  default: &default
+    missingFileHandler: Warn
+    values: ["` + "{{`" + `{{.Release.Name}}` + "`}}" + `/values.yaml"]
+`,
+	})
+	app := &App{
+		readFile:   testFs.ReadFile,
+		fileExists: testFs.FileExists,
+		glob:       testFs.Glob,
+		abs:        testFs.Abs,
+		Env:        "default",
+		Logger:     helmexec.NewLogger(os.Stderr, "debug"),
+	}
+	st, err := app.loadDesiredStateFromYaml(yamlFile)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+
+	if st.HelmDefaults.TillerNamespace != "TILLER_NS" {
+		t.Errorf("unexpected helmDefaults.tillerNamespace: expected=TILLER_NS, got=%s", st.HelmDefaults.TillerNamespace)
+	}
+
+	if st.Releases[0].Name != "myrelease0" {
+		t.Errorf("unexpected releases[0].name: expected=myrelease0, got=%s", st.Releases[0].Name)
+	}
+
+	if st.HelmDefaults.KubeContext != "FOO" {
+		t.Errorf("unexpected helmDefaults.kubeContext: expected=FOO, got=%s", st.HelmDefaults.KubeContext)
+	}
+}
+
+func TestLoadDesiredStateFromYaml_MultiPartTemplate_WithNonDefaultEnv(t *testing.T) {
+	yamlFile := "/path/to/yaml/file"
+	yamlContent := `bases:
+- ../base.yaml
+---
+bases:
+- ../base.gotmpl
+---
+helmDefaults:
+  kubeContext: {{ .Environment.Values.foo }}
+---
+releases:
+- name: myrelease0
+  chart: mychart0
+---
+
+{{ readFile "templates.yaml" }}
+
+releases:
+- name: myrelease1
+  chart: mychart1
+  labels:
+    stage: pre
+    foo: bar
+- name: myrelease1
+  chart: mychart2
+  labels:
+    stage: post
+  <<: *default
+`
+	testFs := state.NewTestFs(map[string]string{
+		yamlFile: yamlContent,
+		"/path/to/base.yaml": `environments:
+  test:
+    values:
+    - environments/default/1.yaml
+`,
+		"/path/to/yaml/environments/default/1.yaml": `foo: FOO`,
+		"/path/to/base.gotmpl": `environments:
+  test:
+    values:
+    - environments/default/2.yaml
+
+helmDefaults:
+  tillerNamespace: {{ .Environment.Values.tillerNs }}
+`,
+		"/path/to/yaml/environments/default/2.yaml": `tillerNs: TILLER_NS`,
+		"/path/to/yaml/templates.yaml": `templates:
+  default: &default
+    missingFileHandler: Warn
+    values: ["` + "{{`" + `{{.Release.Name}}` + "`}}" + `/values.yaml"]
+`,
+	})
+	app := &App{
+		readFile:   testFs.ReadFile,
+		fileExists: testFs.FileExists,
+		glob:       testFs.Glob,
+		abs:        testFs.Abs,
+		Env:        "test",
+		Logger:     helmexec.NewLogger(os.Stderr, "debug"),
+	}
+	st, err := app.loadDesiredStateFromYaml(yamlFile)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if st.HelmDefaults.TillerNamespace != "TILLER_NS" {
+		t.Errorf("unexpected helmDefaults.tillerNamespace: expected=TILLER_NS, got=%s", st.HelmDefaults.TillerNamespace)
+	}
+
+	if st.Releases[0].Name != "myrelease0" {
+		t.Errorf("unexpected releases[0].name: expected=myrelease0, got=%s", st.Releases[0].Name)
+	}
+	if st.Releases[1].Name != "myrelease1" {
+		t.Errorf("unexpected releases[1].name: expected=myrelease1, got=%s", st.Releases[1].Name)
+	}
+	if st.Releases[2].Name != "myrelease1" {
+		t.Errorf("unexpected releases[2].name: expected=myrelease1, got=%s", st.Releases[2].Name)
+	}
+	if st.Releases[2].Values[0] != "{{`{{.Release.Name}}`}}/values.yaml" {
+		t.Errorf("unexpected releases[2].missingFileHandler: expected={{`{{.Release.Name}}`}}/values.yaml, got=%s", st.Releases[1].Values[0])
+	}
+	if *st.Releases[2].MissingFileHandler != "Warn" {
+		t.Errorf("unexpected releases[2].missingFileHandler: expected=Warn, got=%s", *st.Releases[1].MissingFileHandler)
+	}
+
+	if st.Releases[2].Values[0] != "{{`{{.Release.Name}}`}}/values.yaml" {
+		t.Errorf("unexpected releases[2].missingFileHandler: expected={{`{{.Release.Name}}`}}/values.yaml, got=%s", st.Releases[1].Values[0])
+	}
+
+	if st.HelmDefaults.KubeContext != "FOO" {
+		t.Errorf("unexpected helmDefaults.kubeContext: expected=FOO, got=%s", st.HelmDefaults.KubeContext)
+	}
+}
+
+func TestLoadDesiredStateFromYaml_MultiPartTemplate_WithReverse(t *testing.T) {
+	yamlFile := "/path/to/yaml/file"
+	yamlContent := `
+{{ readFile "templates.yaml" }}
+
+releases:
+- name: myrelease0
+  chart: mychart0
+- name: myrelease1
+  chart: mychart1
+  <<: *default
+---
+
+{{ readFile "templates.yaml" }}
+
+releases:
+- name: myrelease2
+  chart: mychart2
+- name: myrelease3
+  chart: mychart3
+  <<: *default
+`
+	testFs := state.NewTestFs(map[string]string{
+		yamlFile: yamlContent,
+		"/path/to/yaml/templates.yaml": `templates:
+  default: &default
+    missingFileHandler: Warn
+    values: ["` + "{{`" + `{{.Release.Name}}` + "`}}" + `/values.yaml"]
+`,
+	})
+	app := &App{
+		readFile: testFs.ReadFile,
+		glob:     testFs.Glob,
+		abs:      testFs.Abs,
+		Env:      "default",
+		Logger:   helmexec.NewLogger(os.Stderr, "debug"),
+		Reverse:  true,
+	}
+	st, err := app.loadDesiredStateFromYaml(yamlFile)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if st.Releases[0].Name != "myrelease3" {
+		t.Errorf("unexpected releases[0].name: expected=myrelease3, got=%s", st.Releases[0].Name)
+	}
+	if st.Releases[1].Name != "myrelease2" {
+		t.Errorf("unexpected releases[0].name: expected=myrelease2, got=%s", st.Releases[1].Name)
+	}
+	if st.Releases[2].Name != "myrelease1" {
+		t.Errorf("unexpected releases[0].name: expected=myrelease1, got=%s", st.Releases[2].Name)
+	}
+	if st.Releases[3].Name != "myrelease0" {
+		t.Errorf("unexpected releases[0].name: expected=myrelease0, got=%s", st.Releases[3].Name)
 	}
 }
