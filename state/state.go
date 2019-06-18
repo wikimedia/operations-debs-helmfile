@@ -15,9 +15,6 @@ import (
 
 	"regexp"
 
-	"os/exec"
-	"syscall"
-
 	"net/url"
 
 	"github.com/roboll/helmfile/environment"
@@ -30,9 +27,12 @@ import (
 
 // HelmState structure for the helmfile
 type HelmState struct {
-	basePath           string
-	Environments       map[string]EnvironmentSpec
-	FilePath           string
+	basePath string
+	FilePath string
+
+	Environments map[string]EnvironmentSpec `yaml:"environments"`
+
+	Bases              []string          `yaml:"bases"`
 	HelmDefaults       HelmSpec          `yaml:"helmDefaults"`
 	Helmfiles          []SubHelmfileSpec `yaml:"helmfiles"`
 	DeprecatedContext  string            `yaml:"context"`
@@ -52,6 +52,8 @@ type HelmState struct {
 
 	removeFile func(string) error
 	fileExists func(string) (bool, error)
+	glob       func(string) ([]string, error)
+	tempDir    func(string, string) (string, error)
 
 	runner helmexec.Runner
 }
@@ -171,6 +173,11 @@ type AffectedReleases struct {
 
 const DefaultEnv = "default"
 
+const MissingFileHandlerError = "Error"
+const MissingFileHandlerInfo = "Info"
+const MissingFileHandlerWarn = "Warn"
+const MissingFileHandlerDebug = "Debug"
+
 func (st *HelmState) applyDefaultsTo(spec *ReleaseSpec) {
 	if st.Namespace != "" {
 		spec.Namespace = st.Namespace
@@ -200,15 +207,6 @@ func (st *HelmState) SyncRepos(helm RepoUpdater) []error {
 		return []error{err}
 	}
 	return nil
-}
-
-type ReleaseError struct {
-	*ReleaseSpec
-	underlying error
-}
-
-func (e *ReleaseError) Error() string {
-	return e.underlying.Error()
 }
 
 type syncResult struct {
@@ -248,9 +246,20 @@ func (st *HelmState) prepareSyncReleases(helm helmexec.Interface, additionalValu
 			for release := range jobs {
 				st.applyDefaultsTo(release)
 
+				// If `installed: false`, the only potential operation on this release would be uninstalling.
+				// We skip generating values files in that case, because for an uninstall with `helm delete`, we don't need to those.
+				// The values files are for `helm upgrade -f values.yaml` calls that happens when the release has `installed: true`.
+				// This logic addresses:
+				// - https://github.com/roboll/helmfile/issues/519
+				// - https://github.com/roboll/helmfile/issues/616
+				if !release.Desired() {
+					results <- syncPrepareResult{release: release, flags: []string{}, errors: []*ReleaseError{}}
+					continue
+				}
+
 				flags, flagsErr := st.flagsForUpgrade(helm, release, workerIndex)
 				if flagsErr != nil {
-					results <- syncPrepareResult{errors: []*ReleaseError{&ReleaseError{release, flagsErr}}}
+					results <- syncPrepareResult{errors: []*ReleaseError{newReleaseError(release, flagsErr)}}
 					continue
 				}
 
@@ -258,14 +267,14 @@ func (st *HelmState) prepareSyncReleases(helm helmexec.Interface, additionalValu
 				for _, value := range additionalValues {
 					valfile, err := filepath.Abs(value)
 					if err != nil {
-						errs = append(errs, &ReleaseError{release, err})
+						errs = append(errs, newReleaseError(release, err))
 					}
 
 					ok, err := st.fileExists(valfile)
 					if err != nil {
-						errs = append(errs, &ReleaseError{release, err})
+						errs = append(errs, newReleaseError(release, err))
 					} else if !ok {
-						errs = append(errs, &ReleaseError{release, fmt.Errorf("file does not exist: %s", valfile)})
+						errs = append(errs, newReleaseError(release, fmt.Errorf("file does not exist: %s", valfile)))
 					}
 					flags = append(flags, "--values", valfile)
 				}
@@ -307,7 +316,9 @@ func (st *HelmState) isReleaseInstalled(context helmexec.HelmContext, helm helme
 
 func (st *HelmState) DetectReleasesToBeDeleted(helm helmexec.Interface) ([]*ReleaseSpec, error) {
 	detected := []*ReleaseSpec{}
-	for _, release := range st.Releases {
+	for i := range st.Releases {
+		release := st.Releases[i]
+
 		if !release.Desired() {
 			installed, err := st.isReleaseInstalled(st.createHelmContext(&release, 0), helm, release)
 			if err != nil {
@@ -349,27 +360,32 @@ func (st *HelmState) SyncReleases(affectedReleases *AffectedReleases, helm helme
 				chart := normalizeChart(st.basePath, release.Chart)
 				var relErr *ReleaseError
 				context := st.createHelmContext(release, workerIndex)
-				if !release.Desired() {
+
+				if _, err := st.triggerPresyncEvent(release, "sync"); err != nil {
+					relErr = newReleaseError(release, err)
+				} else if !release.Desired() {
 					installed, err := st.isReleaseInstalled(context, helm, *release)
 					if err != nil {
-						relErr = &ReleaseError{release, err}
+						relErr = newReleaseError(release, err)
 					} else if installed {
 						if err := helm.DeleteRelease(context, release.Name, "--purge"); err != nil {
 							affectedReleases.Failed = append(affectedReleases.Failed, release)
-							relErr = &ReleaseError{release, err}
+							relErr = newReleaseError(release, err)
 						} else {
 							affectedReleases.Deleted = append(affectedReleases.Deleted, release)
 						}
 					}
 				} else if err := helm.SyncRelease(context, release.Name, chart, flags...); err != nil {
 					affectedReleases.Failed = append(affectedReleases.Failed, release)
-					relErr = &ReleaseError{release, err}
+					relErr = newReleaseError(release, err)
 				} else {
 					affectedReleases.Upgraded = append(affectedReleases.Upgraded, release)
 					installedVersion, err := st.getDeployedVersion(context, helm, release)
-					//err is not really impacting so just ignors it
-					st.logger.Debugf("getting deployed release version failed:%v", err)
-					release.installedVersion = installedVersion
+					if err != nil { //err is not really impacting so just log it
+						st.logger.Debugf("getting deployed release version failed:%v", err)
+					} else {
+						release.installedVersion = installedVersion
+					}
 				}
 
 				if relErr == nil {
@@ -378,7 +394,11 @@ func (st *HelmState) SyncReleases(affectedReleases *AffectedReleases, helm helme
 					results <- syncResult{errors: []*ReleaseError{relErr}}
 				}
 
-				if _, err := st.triggerCleanupEvent(prep.release, "sync"); err != nil {
+				if _, err := st.triggerPostsyncEvent(release, "sync"); err != nil {
+					st.logger.Warnf("warn: %v\n", err)
+				}
+
+				if _, err := st.triggerCleanupEvent(release, "sync"); err != nil {
 					st.logger.Warnf("warn: %v\n", err)
 				}
 			}
@@ -455,6 +475,10 @@ func (st *HelmState) downloadCharts(helm helmexec.Interface, dir string, concurr
 						chartPath = path.Join(dir, release.Name, "latest", release.Chart)
 					}
 
+					if st.isDevelopment(release) {
+						fetchFlags = append(fetchFlags, "--devel")
+					}
+
 					// only fetch chart if it is not already fetched
 					if _, err := os.Stat(chartPath); os.IsNotExist(err) {
 						fetchFlags = append(fetchFlags, "--untar", "--untardir", chartPath)
@@ -468,7 +492,6 @@ func (st *HelmState) downloadCharts(helm helmexec.Interface, dir string, concurr
 						chartPath = filepath.Dir(fullChartPath)
 					}
 				}
-
 				results <- &downloadResults{release.Name, chartPath}
 			}
 		},
@@ -508,7 +531,9 @@ func (st *HelmState) TemplateReleases(helm helmexec.Interface, additionalValues 
 		helm.SetExtraArgs(args...)
 	}
 
-	for _, release := range st.Releases {
+	for i := range st.Releases {
+		release := st.Releases[i]
+
 		if !release.Desired() {
 			continue
 		}
@@ -568,7 +593,9 @@ func (st *HelmState) LintReleases(helm helmexec.Interface, additionalValues []st
 		helm.SetExtraArgs(args...)
 	}
 
-	for _, release := range st.Releases {
+	for i := range st.Releases {
+		release := st.Releases[i]
+
 		if !release.Desired() {
 			continue
 		}
@@ -607,18 +634,8 @@ func (st *HelmState) LintReleases(helm helmexec.Interface, additionalValues []st
 	return nil
 }
 
-type DiffError struct {
-	*ReleaseSpec
-	err  error
-	Code int
-}
-
-func (e *DiffError) Error() string {
-	return e.err.Error()
-}
-
 type diffResult struct {
-	err *DiffError
+	err *ReleaseError
 }
 
 type diffPrepareResult struct {
@@ -686,7 +703,7 @@ func (st *HelmState) prepareDiffReleases(helm helmexec.Interface, additionalValu
 				if len(errs) > 0 {
 					rsErrs := make([]*ReleaseError, len(errs))
 					for i, e := range errs {
-						rsErrs[i] = &ReleaseError{release, e}
+						rsErrs[i] = newReleaseError(release, e)
 					}
 					results <- diffPrepareResult{errors: rsErrs}
 				} else {
@@ -757,12 +774,11 @@ func (st *HelmState) DiffReleases(helm helmexec.Interface, additionalValues []st
 				release := prep.release
 				if err := helm.DiffRelease(st.createHelmContext(release, workerIndex), release.Name, normalizeChart(st.basePath, release.Chart), flags...); err != nil {
 					switch e := err.(type) {
-					case *exec.ExitError:
+					case helmexec.ExitError:
 						// Propagate any non-zero exit status from the external command like `helm` that is failed under the hood
-						status := e.Sys().(syscall.WaitStatus)
-						results <- diffResult{&DiffError{release, err, status.ExitStatus()}}
+						results <- diffResult{&ReleaseError{release, err, e.ExitStatus()}}
 					default:
-						results <- diffResult{&DiffError{release, err, 0}}
+						results <- diffResult{&ReleaseError{release, err, 0}}
 					}
 				} else {
 					// diff succeeded, found no changes
@@ -915,18 +931,28 @@ func (st *HelmState) FilterReleases() error {
 	return nil
 }
 
-func (st *HelmState) PrepareRelease(helm helmexec.Interface, helmfileCommand string) []error {
+func (st *HelmState) PrepareReleases(helm helmexec.Interface, helmfileCommand string) []error {
 	errs := []error{}
 
-	for _, release := range st.Releases {
+	for i := range st.Releases {
+		release := st.Releases[i]
+
 		if _, err := st.triggerPrepareEvent(&release, helmfileCommand); err != nil {
-			errs = append(errs, &ReleaseError{&release, err})
+			errs = append(errs, newReleaseError(&release, err))
 			continue
 		}
 	}
 	if len(errs) != 0 {
 		return errs
 	}
+
+	updated, err := st.ResolveDeps()
+	if err != nil {
+		return []error{err}
+	}
+
+	*st = *updated
+
 	return nil
 }
 
@@ -936,6 +962,14 @@ func (st *HelmState) triggerPrepareEvent(r *ReleaseSpec, helmfileCommand string)
 
 func (st *HelmState) triggerCleanupEvent(r *ReleaseSpec, helmfileCommand string) (bool, error) {
 	return st.triggerReleaseEvent("cleanup", r, helmfileCommand)
+}
+
+func (st *HelmState) triggerPresyncEvent(r *ReleaseSpec, helmfileCommand string) (bool, error) {
+	return st.triggerReleaseEvent("presync", r, helmfileCommand)
+}
+
+func (st *HelmState) triggerPostsyncEvent(r *ReleaseSpec, helmfileCommand string) (bool, error) {
+	return st.triggerReleaseEvent("postsync", r, helmfileCommand)
 }
 
 func (st *HelmState) triggerReleaseEvent(evt string, r *ReleaseSpec, helmfileCmd string) (bool, error) {
@@ -955,6 +989,11 @@ func (st *HelmState) triggerReleaseEvent(evt string, r *ReleaseSpec, helmfileCmd
 	return bus.Trigger(evt, data)
 }
 
+// ResolveDeps returns a copy of this helmfile state with the concrete chart version numbers filled in for remote chart dependencies
+func (st *HelmState) ResolveDeps() (*HelmState, error) {
+	return st.mergeLockedDependencies()
+}
+
 // UpdateDeps wrapper for updating dependencies on the releases
 func (st *HelmState) UpdateDeps(helm helmexec.Interface) []error {
 	errs := []error{}
@@ -966,6 +1005,18 @@ func (st *HelmState) UpdateDeps(helm helmexec.Interface) []error {
 			}
 		}
 	}
+
+	if len(errs) == 0 {
+		tempDir := st.tempDir
+		if tempDir == nil {
+			tempDir = ioutil.TempDir
+		}
+		_, err := st.updateDependenciesInTempDir(helm, tempDir)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("unable to update deps: %v", err))
+		}
+	}
+
 	if len(errs) != 0 {
 		return errs
 	}
@@ -1017,7 +1068,12 @@ func normalizeChart(basePath, chart string) string {
 
 func isLocalChart(chart string) bool {
 	regex, _ := regexp.Compile("^[.]?./")
-	return regex.MatchString(chart)
+	matched := regex.MatchString(chart)
+	if matched {
+		return true
+	}
+
+	return chart == "" || chart[0] == '/' || len(strings.Split(chart, "/")) != 2
 }
 
 func pathExists(chart string) bool {
@@ -1033,7 +1089,10 @@ func chartNameWithoutRepository(chart string) string {
 // find "Chart.yaml"
 func findChartDirectory(topLevelDir string) (string, error) {
 	var files []string
-	filepath.Walk(topLevelDir, func(path string, f os.FileInfo, _ error) error {
+	filepath.Walk(topLevelDir, func(path string, f os.FileInfo, err error) error {
+		if err != nil {
+			return fmt.Errorf("error walking through %s: %v", path, err)
+		}
 		if !f.IsDir() {
 			r, err := regexp.MatchString("Chart.yaml", f.Name())
 			if err == nil && r {
@@ -1200,26 +1259,18 @@ func (st *HelmState) generateTemporaryValuesFiles(values []interface{}, missingF
 	for _, value := range values {
 		switch typedValue := value.(type) {
 		case string:
-			path := st.normalizePath(typedValue)
-
-			ok, err := st.fileExists(path)
+			paths, skip, err := st.resolveFile(missingFileHandler, "values", typedValue)
 			if err != nil {
 				return nil, err
 			}
-			if !ok {
-				if missingFileHandler == nil || *missingFileHandler == "Error" {
-					return nil, fmt.Errorf("file does not exist: %s", path)
-				} else if *missingFileHandler == "Warn" {
-					st.logger.Warnf("skipping missing values file \"%s\"", path)
-					continue
-				} else if *missingFileHandler == "Info" {
-					st.logger.Infof("skipping missing values file \"%s\"", path)
-					continue
-				} else {
-					st.logger.Debugf("skipping missing values file \"%s\"", path)
-					continue
-				}
+			if skip {
+				continue
 			}
+
+			if len(paths) > 1 {
+				return nil, fmt.Errorf("glob patterns in release values and secrets is not supported yet. please submit a feature request if necessary")
+			}
+			path := paths[0]
 
 			yamlBytes, err := st.RenderValuesFileToBytes(path)
 			if err != nil {
@@ -1285,25 +1336,18 @@ func (st *HelmState) namespaceAndValuesFlags(helm helmexec.Interface, release *R
 	release.generatedValues = append(release.generatedValues, generatedFiles...)
 
 	for _, value := range release.Secrets {
-		path := st.normalizePath(release.ValuesPathPrefix + value)
-		ok, err := st.fileExists(path)
+		paths, skip, err := st.resolveFile(release.MissingFileHandler, "secrets", release.ValuesPathPrefix+value)
 		if err != nil {
 			return nil, err
 		}
-		if !ok {
-			if release.MissingFileHandler == nil || *release.MissingFileHandler == "Error" {
-				return nil, err
-			} else if *release.MissingFileHandler == "Warn" {
-				st.logger.Warnf("skipping missing secrets file \"%s\"", path)
-				continue
-			} else if *release.MissingFileHandler == "Info" {
-				st.logger.Infof("skipping missing secrets file \"%s\"", path)
-				continue
-			} else {
-				st.logger.Debugf("skipping missing secrets file \"%s\"", path)
-				continue
-			}
+		if skip {
+			continue
 		}
+
+		if len(paths) > 1 {
+			return nil, fmt.Errorf("glob patterns in release secret file is not supported yet. please submit a feature request if necessary")
+		}
+		path := paths[0]
 
 		decryptFlags := st.appendTillerFlags([]string{}, release)
 		valfile, err := helm.DecryptSecret(st.createHelmContext(release, workerIndex), path, decryptFlags...)
@@ -1359,6 +1403,49 @@ func (st *HelmState) namespaceAndValuesFlags(helm helmexec.Interface, release *R
 	 **************/
 
 	return flags, nil
+}
+
+func (st *HelmState) resolveFile(missingFileHandler *string, tpe, path string) ([]string, bool, error) {
+	title := fmt.Sprintf("%s file", tpe)
+
+	files, err := st.ExpandPaths(path)
+	if err != nil {
+		return nil, false, err
+	}
+
+	var handlerId string
+
+	if missingFileHandler != nil {
+		handlerId = *missingFileHandler
+	} else {
+		handlerId = MissingFileHandlerError
+	}
+
+	if len(files) == 0 {
+		switch handlerId {
+		case MissingFileHandlerError:
+			return nil, false, fmt.Errorf("%s matching \"%s\" does not exist", title, path)
+		case MissingFileHandlerWarn:
+			st.logger.Warnf("skipping missing %s matching \"%s\"", title, path)
+			return nil, true, nil
+		case MissingFileHandlerInfo:
+			st.logger.Infof("skipping missing %s matching \"%s\"", title, path)
+			return nil, true, nil
+		case MissingFileHandlerDebug:
+			st.logger.Debugf("skipping missing %s matching \"%s\"", title, path)
+			return nil, true, nil
+		default:
+			available := []string{
+				MissingFileHandlerError,
+				MissingFileHandlerWarn,
+				MissingFileHandlerInfo,
+				MissingFileHandlerDebug,
+			}
+			return nil, false, fmt.Errorf("invalid missing file handler \"%s\" while processing \"%s\" in \"%s\": it must be one of %s", handlerId, path, st.FilePath, available)
+		}
+	}
+
+	return files, false, nil
 }
 
 // DisplayAffectedReleases logs the upgraded, deleted and in error releases

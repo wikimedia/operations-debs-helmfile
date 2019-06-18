@@ -1,7 +1,8 @@
 package state
 
 import (
-	"fmt"
+	"go.uber.org/zap"
+	"io/ioutil"
 	"path/filepath"
 	"reflect"
 	"testing"
@@ -9,6 +10,16 @@ import (
 	. "gotest.tools/assert"
 	"gotest.tools/assert/cmp"
 )
+
+func createFromYaml(content []byte, file string, env string, logger *zap.SugaredLogger) (*HelmState, error) {
+	c := &StateCreator{
+		logger:   logger,
+		readFile: ioutil.ReadFile,
+		abs:      filepath.Abs,
+		Strict:   true,
+	}
+	return c.ParseAndLoad(content, filepath.Dir(file), file, env, false, nil)
+}
 
 func TestReadFromYaml(t *testing.T) {
 	yamlFile := "example/path/to/yaml/file"
@@ -87,23 +98,17 @@ bar: {{ readFile "bar.txt" }}
 
 	expectedValues := `env: production`
 
-	readFile := func(filename string) ([]byte, error) {
-		switch filename {
-		case fooYamlFile:
-			return fooYamlContent, nil
-		case barYamlFile:
-			return barYamlContent, nil
-		case barTextFile:
-			return barTextContent, nil
-		case valuesFile:
-			return valuesContent, nil
-		}
-		return nil, fmt.Errorf("unexpected filename: %s", filename)
-	}
+	testFs := NewTestFs(map[string]string{
+		fooYamlFile: string(fooYamlContent),
+		barYamlFile: string(barYamlContent),
+		barTextFile: string(barTextContent),
+		valuesFile:  string(valuesContent),
+	})
+	testFs.Cwd = "/example/path/to"
 
-	state, err := NewCreator(logger, readFile, filepath.Abs).CreateFromYaml(yamlContent, yamlFile, "production")
+	state, err := NewCreator(logger, testFs.ReadFile, testFs.FileExists, testFs.Abs, testFs.Glob).ParseAndLoad(yamlContent, filepath.Dir(yamlFile), yamlFile, "production", false, nil)
 	if err != nil {
-		t.Errorf("unexpected error: %v", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
 
 	actual := state.Env.Values

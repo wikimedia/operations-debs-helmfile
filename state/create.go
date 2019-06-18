@@ -2,11 +2,12 @@ package state
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
+	"sort"
 
 	"github.com/imdario/mergo"
 	"github.com/roboll/helmfile/environment"
@@ -33,42 +34,35 @@ func (e *UndefinedEnvError) Error() string {
 	return e.msg
 }
 
-func createFromYaml(content []byte, file string, env string, logger *zap.SugaredLogger) (*HelmState, error) {
-	c := &creator{
-		logger,
-		ioutil.ReadFile,
-		filepath.Abs,
-		true,
-	}
-	return c.CreateFromYaml(content, file, env)
-}
-
-type creator struct {
-	logger   *zap.SugaredLogger
-	readFile func(string) ([]byte, error)
-	abs      func(string) (string, error)
+type StateCreator struct {
+	logger     *zap.SugaredLogger
+	readFile   func(string) ([]byte, error)
+	fileExists func(string) (bool, error)
+	abs        func(string) (string, error)
+	glob       func(string) ([]string, error)
 
 	Strict bool
+
+	LoadFile func(inheritedEnv *environment.Environment, baseDir, file string, evaluateBases bool) (*HelmState, error)
 }
 
-func NewCreator(logger *zap.SugaredLogger, readFile func(string) ([]byte, error), abs func(string) (string, error)) *creator {
-	return &creator{
-		logger:   logger,
-		readFile: readFile,
-		abs:      abs,
-		Strict:   true,
+func NewCreator(logger *zap.SugaredLogger, readFile func(string) ([]byte, error), fileExists func(string) (bool, error), abs func(string) (string, error), glob func(string) ([]string, error)) *StateCreator {
+	return &StateCreator{
+		logger:     logger,
+		readFile:   readFile,
+		fileExists: fileExists,
+		abs:        abs,
+		glob:       glob,
+		Strict:     true,
 	}
 }
 
-func (c *creator) CreateFromYaml(content []byte, file string, env string) (*HelmState, error) {
+// Parse parses YAML into HelmState
+func (c *StateCreator) Parse(content []byte, baseDir, file string) (*HelmState, error) {
 	var state HelmState
 
-	basePath, err := c.abs(filepath.Dir(file))
-	if err != nil {
-		return nil, &StateLoadError{fmt.Sprintf("failed to read %s", file), err}
-	}
 	state.FilePath = file
-	state.basePath = basePath
+	state.basePath = baseDir
 
 	decoder := yaml.NewDecoder(bytes.NewReader(content))
 	if !c.Strict {
@@ -108,57 +102,132 @@ func (c *creator) CreateFromYaml(content []byte, file string, env string) (*Helm
 
 	state.logger = c.logger
 
-	e, err := state.loadEnv(env, c.readFile)
-	if err != nil {
-		return nil, &StateLoadError{fmt.Sprintf("failed to read %s", file), err}
-	}
-	state.Env = *e
-
 	state.readFile = c.readFile
 	state.removeFile = os.Remove
-	state.fileExists = func(path string) (bool, error) {
-		_, err := os.Stat(path)
-
-		if err != nil {
-			if os.IsNotExist(err) {
-				return false, nil
-			}
-			return false, err
-		}
-		return true, nil
-	}
+	state.fileExists = c.fileExists
+	state.glob = c.glob
 
 	return &state, nil
 }
 
-func (st *HelmState) loadEnv(name string, readFile func(string) ([]byte, error)) (*environment.Environment, error) {
+// LoadEnvValues loads environment values files relative to the `baseDir`
+func (c *StateCreator) LoadEnvValues(target *HelmState, env string, ctxEnv *environment.Environment) (*HelmState, error) {
+	state := *target
+
+	e, err := state.loadEnvValues(env, ctxEnv, c.readFile, c.glob)
+	if err != nil {
+		return nil, &StateLoadError{fmt.Sprintf("failed to read %s", state.FilePath), err}
+	}
+	state.Env = *e
+
+	return &state, nil
+}
+
+// Parses YAML into HelmState, while loading environment values files relative to the `baseDir`
+func (c *StateCreator) ParseAndLoad(content []byte, baseDir, file string, envName string, evaluateBases bool, envValues *environment.Environment) (*HelmState, error) {
+	state, err := c.Parse(content, baseDir, file)
+	if err != nil {
+		return nil, err
+	}
+
+	if !evaluateBases {
+		if len(state.Bases) > 0 {
+			return nil, errors.New("nested `base` helmfile is unsupported. please submit a feature request if you need this!")
+		}
+	}
+
+	state, err = c.loadBases(envValues, state, baseDir)
+	if err != nil {
+		return nil, err
+	}
+
+	return c.LoadEnvValues(state, envName, envValues)
+}
+
+func (c *StateCreator) loadBases(envValues *environment.Environment, st *HelmState, baseDir string) (*HelmState, error) {
+	layers := []*HelmState{}
+	for _, b := range st.Bases {
+		base, err := c.LoadFile(envValues, baseDir, b, false)
+		if err != nil {
+			return nil, err
+		}
+		layers = append(layers, base)
+	}
+	layers = append(layers, st)
+
+	for i := 1; i < len(layers); i++ {
+		if err := mergo.Merge(layers[0], layers[i], mergo.WithAppendSlice); err != nil {
+			return nil, err
+		}
+	}
+
+	return layers[0], nil
+}
+
+func (st *HelmState) ExpandPaths(globPattern string) ([]string, error) {
+	result := []string{}
+	absPathPattern := st.normalizePath(globPattern)
+	matches, err := st.glob(absPathPattern)
+	if err != nil {
+		return nil, fmt.Errorf("failed processing %s: %v", globPattern, err)
+	}
+
+	sort.Strings(matches)
+
+	result = append(result, matches...)
+	return result, nil
+}
+
+func (st *HelmState) loadEnvValues(name string, ctxEnv *environment.Environment, readFile func(string) ([]byte, error), glob func(string) ([]string, error)) (*environment.Environment, error) {
 	envVals := map[string]interface{}{}
 	envSpec, ok := st.Environments[name]
 	if ok {
-		for _, envvalFile := range envSpec.Values {
-			envvalFullPath := filepath.Join(st.basePath, envvalFile)
+		var envValuesFiles []string
+		for _, urlOrPath := range envSpec.Values {
+			resolved, skipped, err := st.resolveFile(envSpec.MissingFileHandler, "environment values", urlOrPath)
+			if err != nil {
+				return nil, err
+			}
+			if skipped {
+				continue
+			}
+
+			envValuesFiles = append(envValuesFiles, resolved...)
+		}
+
+		for _, envvalFullPath := range envValuesFiles {
 			tmplData := EnvironmentTemplateData{Environment: environment.EmptyEnvironment, Namespace: ""}
 			r := tmpl.NewFileRenderer(readFile, filepath.Dir(envvalFullPath), tmplData)
 			bytes, err := r.RenderToBytes(envvalFullPath)
 			if err != nil {
-				return nil, fmt.Errorf("failed to load environment values file \"%s\": %v", envvalFile, err)
+				return nil, fmt.Errorf("failed to load environment values file \"%s\": %v", envvalFullPath, err)
 			}
 			m := map[string]interface{}{}
 			if err := yaml.Unmarshal(bytes, &m); err != nil {
-				return nil, fmt.Errorf("failed to load environment values file \"%s\": %v", envvalFile, err)
+				return nil, fmt.Errorf("failed to load environment values file \"%s\": %v", envvalFullPath, err)
 			}
 			if err := mergo.Merge(&envVals, &m, mergo.WithOverride); err != nil {
-				return nil, fmt.Errorf("failed to load \"%s\": %v", envvalFile, err)
+				return nil, fmt.Errorf("failed to load \"%s\": %v", envvalFullPath, err)
 			}
 		}
 
 		if len(envSpec.Secrets) > 0 {
 			helm := helmexec.New(st.logger, "")
-			for _, secFile := range envSpec.Secrets {
-				path := filepath.Join(st.basePath, secFile)
-				if _, err := os.Stat(path); os.IsNotExist(err) {
+
+			var envSecretFiles []string
+			for _, urlOrPath := range envSpec.Secrets {
+				resolved, skipped, err := st.resolveFile(envSpec.MissingFileHandler, "environment values", urlOrPath)
+				if err != nil {
 					return nil, err
 				}
+				if skipped {
+					continue
+				}
+
+				envSecretFiles = append(envSecretFiles, resolved...)
+			}
+
+			for _, path := range envSecretFiles {
 				// Work-around to allow decrypting environment secrets
 				//
 				// We don't have releases loaded yet and therefore unable to decide whether
@@ -175,20 +244,32 @@ func (st *HelmState) loadEnv(name string, readFile func(string) ([]byte, error))
 				}
 				bytes, err := readFile(decFile)
 				if err != nil {
-					return nil, fmt.Errorf("failed to load environment secrets file \"%s\": %v", secFile, err)
+					return nil, fmt.Errorf("failed to load environment secrets file \"%s\": %v", path, err)
 				}
 				m := map[string]interface{}{}
 				if err := yaml.Unmarshal(bytes, &m); err != nil {
-					return nil, fmt.Errorf("failed to load environment secrets file \"%s\": %v", secFile, err)
+					return nil, fmt.Errorf("failed to load environment secrets file \"%s\": %v", path, err)
 				}
 				if err := mergo.Merge(&envVals, &m, mergo.WithOverride); err != nil {
-					return nil, fmt.Errorf("failed to load \"%s\": %v", secFile, err)
+					return nil, fmt.Errorf("failed to load \"%s\": %v", path, err)
 				}
 			}
 		}
-	} else if name != DefaultEnv {
+	} else if ctxEnv == nil && name != DefaultEnv {
 		return nil, &UndefinedEnvError{msg: fmt.Sprintf("environment \"%s\" is not defined", name)}
 	}
 
-	return &environment.Environment{Name: name, Values: envVals}, nil
+	newEnv := &environment.Environment{Name: name, Values: envVals}
+
+	if ctxEnv != nil {
+		intEnv := *ctxEnv
+
+		if err := mergo.Merge(&intEnv, newEnv, mergo.WithAppendSlice); err != nil {
+			return nil, fmt.Errorf("error while merging environment values for \"%s\": %v", name, err)
+		}
+
+		newEnv = &intEnv
+	}
+
+	return newEnv, nil
 }
