@@ -8,10 +8,6 @@ Build-Depends: debhelper (>= 10),
                git,
                ca-certificates,
                golang-go,
-               golang-github-imdario-mergo-dev,
-               golang-github-urfave-cli-dev,
-               golang-go.uber-zap-dev,
-               golang-yaml.v2-dev
 Standards-Version: 4.1.1
 Homepage: https://github.com/roboll/helmfile
 Vcs-Browser: https://anonscm.debian.org/cgit/pkg-go/packages/helmfile.git

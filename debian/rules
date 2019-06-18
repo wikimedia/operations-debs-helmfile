@@ -1,5 +1,9 @@
 #!/usr/bin/make -f
 
+export TAG="0.66.0-wmf1"
+
 %:
 	dh $@ --buildsystem=golang --with=golang
-	
+
+override_dh_auto_build:
+	dh_auto_build -v -- -ldflags '-X main.Version=${TAG}'

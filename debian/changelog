@@ -1,5 +1,11 @@
+helmfile (0.66.0-1) buster; urgency=medium
+
+  * Bumping version to 0.66.0.
+
+ -- Fabian Selles <fsero@wikimedia.org>  Tue, 18 Jun 2019 17:00:23 +0200
+
 helmfile (0.57.0-1) buster; urgency=medium
 
   * Initial WMF debianization.
 
- -- Fabián Selés <fsero@wikimedia.org>  Tue, 09 Apr 2019 17:00:23 +0200
+ -- Fabian Selles <fsero@wikimedia.org>  Tue, 09 Apr 2019 17:00:23 +0200
