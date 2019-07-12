@@ -1,3 +1,9 @@
+helmfile (0.66.0-2) UNRELEASED; urgency=medium
+
+  * Ignore .gitreview in source tree.
+
+ -- Antoine Musso <hashar@free.fr>  Fri, 12 Jul 2019 11:33:53 +0200
+
 helmfile (0.66.0-1) buster; urgency=medium
 
   * Bumping version to 0.66.0.
