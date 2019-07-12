@@ -2,7 +2,7 @@ Source: helmfile
 Section: devel
 Priority: optional
 Maintainer: Wikimedia Service Operations Go Team <sre-service-ops@wikimedia.org>
-Uploaders: fsero@wikimedia.org
+Uploaders: Fabián Sellés <fsero@wikimedia.org>
 Build-Depends: debhelper (>= 10),
                dh-golang,
                git,
