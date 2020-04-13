@@ -1,3 +1,11 @@
+helmfile (0.109.0-1) buster-backports; urgency=medium
+
+  * Non-maintainer upload.
+  * Bump to version 0.109.0
+  * Fix debianization issues
+
+ -- Alexandros Kosiaris <akosiaris@wikimedia.org>  Mon, 13 Apr 2020 17:10:53 +0300
+
 helmfile (0.66.0-2) UNRELEASED; urgency=medium
 
   * Ignore .gitreview in source tree.
