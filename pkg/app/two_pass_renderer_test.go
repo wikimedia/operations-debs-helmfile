@@ -5,13 +5,15 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/roboll/helmfile/helmexec"
-	"github.com/roboll/helmfile/state"
+	"github.com/roboll/helmfile/pkg/helmexec"
+	"github.com/roboll/helmfile/pkg/state"
+	"github.com/roboll/helmfile/pkg/testhelper"
+
 	"gopkg.in/yaml.v2"
 )
 
-func makeLoader(files map[string]string, env string) (*desiredStateLoader, *state.TestFs) {
-	testfs := state.NewTestFs(files)
+func makeLoader(files map[string]string, env string) (*desiredStateLoader, *testhelper.TestFs) {
+	testfs := testhelper.NewTestFs(files)
 	return &desiredStateLoader{
 		env:        env,
 		namespace:  "namespace",
