@@ -11,13 +11,13 @@ One example of how helmfile achieves it is that, `helmfile` fails when you tried
 That is, the following example let `helmfile` fail when you have no `eventApi.replicas` defined in environment values.
 
 ```
-{{ .Environment.Values.eventApi.replicas | default 1 }}
+{{ .Values.eventApi.replicas | default 1 }}
 ```
 
 In case it isn't a mistake and you do want to allow missing keys, use the `getOrNil` template function:
 
 ```
-{{ .Environment.Values | getOrNil "eventApi.replicas" }}
+{{ .Values | getOrNil "eventApi.replicas" }}
 ```
 
 This result in printing `<no value` in your template, that may or may not result in a failure.
@@ -25,14 +25,14 @@ This result in printing `<no value` in your template, that may or may not result
 If you want a kind of default values that is used when a missing key was referenced, use `default` like:
 
 ```
-{{ .Environment.Values | getOrNil "eventApi.replicas" | default 1 }}
+{{ .Values | getOrNil "eventApi.replicas" | default 1 }}
 ```
 
 Now, you get `1` when there is no `eventApi.replicas` defined in environment values.
 
 ## Release Template / Conventional Directory Structure
 
-Introducing helmfile into a large-scale project that involes dozens of releases often results in a lot of repetitions in `helmfile.yaml` files.
+Introducing helmfile into a large-scale project that involves dozens of releases often results in a lot of repetitions in `helmfile.yaml` files.
 
 The example below shows repetitions in `namespace`, `chart`, `values`, and `secrets`:
 
@@ -57,7 +57,7 @@ releases:
   values:
   - "./config/kubernetes-dashboard/values.yaml"
   - "./config/kubernetes-dashboard/{{ .Environment.Name }}.yaml"
-  values:
+  secrets:
   - "./config/kubernetes-dashboard/secrets.yaml"
   - "./config/kubernetes-dashboard/{{ .Environment.Name }}-secrets.yaml"
 ```
@@ -89,7 +89,47 @@ releases:
   <<: *default
 ```
 
+Release Templating supports the following parts of release definition:
+- basic fields: `name`, `namespace`, `chart`, `version`
+- boolean fields: `installed`, `wait`, `tillerless`, `verify` by the means of additional text
+  fields designed for templating only: `installedTemplate`, `waitTemplate`, `tillerlessTemplate`, `verifyTemplate`
+  ```yaml
+  # ...
+    installedTemplate: '{{`{{ eq .Release.Namespace "kube-system" }}`}}'
+    waitTemplate: '{{`{{ eq .Release.Labels.tag "safe" | not }}`}}'
+  # ...
+  ```
+- `set` block values:
+  ```yaml
+  # ...
+    setTemplate:
+    - name: '{{`{{ .Release.Name }}`}}'
+      values: '{{`{{ .Release.Namespace }}`}}'
+  # ...
+  ```
+- `values` and `secrets` file paths:
+  ```yaml
+  # ...
+    valuesTemplate:
+    - config/{{`{{ .Release.Name }}`}}/values.yaml
+    secrets:
+    - config/{{`{{ .Release.Name }}`}}/secrets.yaml
+  # ...
+  ```
+- inline `values` map:
+  ```yaml
+  # ...
+    valuesTemplate:
+    - image:
+        tag: `{{ .Release.Labels.tag }}`
+  # ...
+  ```
+
 See the [issue 428](https://github.com/roboll/helmfile/issues/428) for more context on how this is supposed to work.
+
+## Layering Release Values
+
+Please note, that it is not possible to layer `values` sections. If `values` is defined in the release and in the release template, only the `values` defined in the release will be considered. The same applies to `secrets` and `set`.
 
 ## Layering State Files
 
@@ -103,23 +143,16 @@ Let's assume that your `helmfile.yaml` looks like:
 
 ```
 bases:
-- commons.yaml
 - environments.yaml
 
 releases:
+- name: metricbaet
+  chart: stable/metricbeat
 - name: myapp
   chart: mychart
 ```
 
-Whereas `commons.yaml` contained a monitoring agent:
-
-```yaml
-releases:
-- name: metricbaet
-  chart: stable/metricbeat
-```
-
-And `environments.yaml` contained well-known environments:
+Whereas `environments.yaml` contained well-known environments:
 
 ```yaml
 environments:
@@ -130,10 +163,6 @@ environments:
 At run time, `bases` in your `helmfile.yaml` are evaluated to produce:
 
 ```yaml
-# commons.yaml
-releases:
-- name: metricbaet
-  chart: stable/metricbeat
 ---
 # environments.yaml
 environments:
@@ -144,6 +173,8 @@ environments:
 releases:
 - name: myapp
   chart: mychart
+- name: metricbaet
+  chart: stable/metricbeat
 ```
 
 Finally the resulting YAML documents are merged in the order of occurrence,
@@ -166,6 +197,51 @@ Great!
 Now, repeat the above steps for each your `helmfile.yaml`, so that all your helmfiles becomes DRY.
 
 Please also see [the discussion in the issue 388](https://github.com/roboll/helmfile/issues/388#issuecomment-491710348) for more advanced layering examples.
+
+## Merging Arrays in Layers
+
+Helmfile doesn't merge arrays across layers. That is, the below example doesn't work as you might have expected:
+
+```yaml
+releases:
+- name: metricbaet
+  chart: stable/metricbeat
+---
+releases:
+- name: myapp
+  chart: mychart
+```
+
+Helmfile overrides the `releases` array with the latest layer so the resulting state file will be:
+
+```yaml
+releases:
+# metricbeat release disappeared! but that's how helmfile works
+- name: myapp
+  chart: mychart
+```
+
+A work-around is to treat the state file as a go template and use `readFile` template function to import the common part of your state file as a plain text:
+
+`common.yaml`:
+
+```yaml
+templates:
+  metricbeat: &metricbeat
+    name: metricbeat
+    chart: stable/metricbeat
+```
+
+`helmfile.yaml`:
+
+```yaml
+{{ readFile "common.yaml" }}
+
+releases:
+- <<: *metricbeat
+- name: myapp
+  chart: mychart
+```
 
 ## Layering State Template Files
 
@@ -191,7 +267,7 @@ bases:
 # Part 3: Dynamic Releases
 releases:
   - name: test1
-    chart: mychart-{{ .Environment.Values.myname }}
+    chart: mychart-{{ .Values.myname }}
     values:
       replicaCount: 1
       image:
@@ -226,9 +302,9 @@ Where the gotmpl file loaded in the second part looks like:
 ```yaml
 helmDefaults:
   tillerNamespace: kube-system
-  kubeContext: {{ .Environment.Values.kubeContext }}
+  kubeContext: {{ .Values.kubeContext }}
   verify: false
-  {{ if .Environment.Values.wait }}
+  {{ if .Values.wait }}
   wait: true
   {{ else }}
   wait: false
@@ -238,9 +314,9 @@ helmDefaults:
   force: true
 ```
 
-Each go template is rendered in the context where `.Environment.Values` is inherited from the previous part. 
+Each go template is rendered in the context where `.Values` is inherited from the previous part. 
 
-So in `mydefaults.yaml.gotmpl`, both `.Environment.Values.kubeContext` and `.Environment.Values.wait` are valid as they do exist in the environment values inherited from the previous part(=the first part) of your `helmfile.yaml.gotmpl`, and therefore the template is rendered to:
+So in `mydefaults.yaml.gotmpl`, both `.Values.kubeContext` and `.Values.wait` are valid as they do exist in the environment values inherited from the previous part(=the first part) of your `helmfile.yaml.gotmpl`, and therefore the template is rendered to:
 
 ```yaml
 helmDefaults:
@@ -253,13 +329,13 @@ helmDefaults:
   force: true
 ```
 
-Similarly, the third part of the top-level `helmfile.yaml.gotmpl`, `.Environment.Values.myname` is valid as it is included in the environment values inherited from the previous parts:
+Similarly, the third part of the top-level `helmfile.yaml.gotmpl`, `.Values.myname` is valid as it is included in the environment values inherited from the previous parts:
 
 ```yaml
 # Part 3: Dynamic Releases
 releases:
   - name: test1
-    chart: mychart-{{ .Environment.Values.myname }}
+    chart: mychart-{{ .Values.myname }}
     values:
       replicaCount: 1
       image:

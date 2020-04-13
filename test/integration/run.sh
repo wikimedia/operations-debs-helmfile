@@ -45,9 +45,15 @@ function retry() {
 
 set -e
 info "Using namespace: ${test_ns}"
-info "Using Helm version: $(helm version --short --client | grep -o v.*$)"
-${helm} init --wait --override spec.template.spec.automountServiceAccountToken=true
-${helm} plugin install https://github.com/databus23/helm-diff --version master
+# helm v2
+if helm version --client 2>/dev/null | grep '"v2\.'; then
+  info "Using Helm version: $(helm version --short --client | grep -o v.*$)"
+  ${helm} init --wait --override spec.template.spec.automountServiceAccountToken=true
+# helm v3
+else
+  info "Using Helm version: $(helm version --short | grep -o v.*$)"
+fi
+${helm} plugin install https://github.com/databus23/helm-diff --version v3.0.0-rc.7
 ${kubectl} get namespace ${test_ns} &> /dev/null && warn "Namespace ${test_ns} exists, from a previous test run?"
 $kubectl create namespace ${test_ns} || fail "Could not create namespace ${test_ns}"
 trap "{ $kubectl delete namespace ${test_ns}; }" EXIT # remove namespace whenever we exit this script
@@ -60,10 +66,19 @@ test_start "happypath - simple rollout of httpbin chart"
 info "Diffing ${dir}/happypath.yaml"
 bash -c "${helmfile} -f ${dir}/happypath.yaml diff --detailed-exitcode; code="'$?'"; [ "'${code}'" -eq 2 ]" || fail "unexpected exit code returned by helmfile diff"
 
+info "Diffing ${dir}/happypath.yaml without color"
+bash -c "${helmfile} -f ${dir}/happypath.yaml --no-color diff --detailed-exitcode; code="'$?'"; [ "'${code}'" -eq 2 ]" || fail "unexpected exit code returned by helmfile diff"
+
+info "Diffing ${dir}/happypath.yaml with limited context"
+bash -c "${helmfile} -f ${dir}/happypath.yaml diff --context 3 --detailed-exitcode; code="'$?'"; [ "'${code}'" -eq 2 ]" || fail "unexpected exit code returned by helmfile diff"
+
 info "Templating ${dir}/happypath.yaml"
 ${helmfile} -f ${dir}/happypath.yaml template
 code=$?
 [ ${code} -eq 0 ] || fail "unexpected exit code returned by helmfile template: ${code}"
+
+info "Applying ${dir}/happypath.yaml"
+bash -c "${helmfile} -f ${dir}/happypath.yaml apply --detailed-exitcode; code="'$?'"; echo Code: "'$code'"; [ "'${code}'" -eq 2 ]" || fail "unexpected exit code returned by helmfile apply"
 
 info "Syncing ${dir}/happypath.yaml"
 ${helmfile} -f ${dir}/happypath.yaml sync
@@ -72,9 +87,9 @@ retry 5 "curl --fail $(minikube service --url --namespace=${test_ns} httpbin-htt
 [ ${retry_result} -eq 0 ] || fail "httpbin failed to return 200 OK"
 
 info "Applying ${dir}/happypath.yaml"
-${helmfile} -f ${dir}/happypath.yaml apply
+${helmfile} -f ${dir}/happypath.yaml apply --detailed-exitcode
 code=$?
-[ ${code} -eq 0 ] || fail "unexpected exit code returned by helmfile apply: ${code}"
+[ ${code} -eq 0 ] || fail "unexpected exit code returned by helmfile apply: want 0, got ${code}"
 
 info "Locking dependencies"
 ${helmfile} -f ${dir}/happypath.yaml deps
@@ -85,6 +100,7 @@ info "Applying ${dir}/happypath.yaml with locked dependencies"
 ${helmfile} -f ${dir}/happypath.yaml apply
 code=$?
 [ ${code} -eq 0 ] || fail "unexpected exit code returned by helmfile apply: ${code}"
+${helm} list --namespace=${test_ns} || fail "unable to list releases"
 
 info "Deleting release"
 ${helmfile} -f ${dir}/happypath.yaml delete
@@ -92,6 +108,9 @@ ${helm} status --namespace=${test_ns} httpbin &> /dev/null && fail "release shou
 
 info "Ensuring \"helmfile delete\" doesn't fail when no releases installed"
 ${helmfile} -f ${dir}/happypath.yaml delete || fail "\"helmfile delete\" shouldn't fail when there are no installed releases"
+
+info "Ensuring \"helmfile template\" output does contain only YAML docs"
+(${helmfile} -f ${dir}/happypath.yaml template | kubectl apply -f -) || fail "\"helmfile template | kubectl apply -f -\" shouldn't fail"
 
 test_pass "happypath"
 
