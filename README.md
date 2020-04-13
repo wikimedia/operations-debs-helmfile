@@ -1,19 +1,19 @@
-# helmfile [![CircleCI](https://circleci.com/gh/roboll/helmfile.svg?style=svg)](https://circleci.com/gh/roboll/helmfile)
+# Helmfile [![CircleCI](https://circleci.com/gh/roboll/helmfile.svg?style=svg)](https://circleci.com/gh/roboll/helmfile)
 
 Deploy Kubernetes Helm Charts
 
 [![Docker Repository on Quay](https://quay.io/repository/roboll/helmfile/status "Docker Repository on Quay")](https://quay.io/repository/roboll/helmfile)
 [![Slack Community #helmfile](https://slack.sweetops.com/badge.svg)](https://slack.sweetops.com)
 
-## status
+## Status
 
 Even though Helmfile is used in production environments [across multiple organizations](USERS.md), it is still in its early stage of development, hence versioned 0.x.
 
 Helmfile complies to Semantic Versioning 2.0.0 in which v0.x means that there could be backward-incompatible changes for every release.
 
-Note that we will try our best to document any backward incompatibility.
+Note that we will try our best to document any backward incompatibility. And in reality, helmfile had no breaking change for a year or so.
 
-## about
+## About
 
 Helmfile is a declarative spec for deploying helm charts. It lets you...
 
@@ -23,11 +23,21 @@ Helmfile is a declarative spec for deploying helm charts. It lets you...
 
 To avoid upgrades for each iteration of `helm`, the `helmfile` executable delegates to `helm` - as a result, `helm` must be installed.
 
-## configuration syntax
+## Highlights
 
-**CAUTION**: This documentation is for the development version of Helmfile. If you are looking for the documentation for any of releases, please switch to the corresponding release tag like [v0.31.0](https://github.com/roboll/helmfile/tree/v0.31.0).
+**Declarative**: Write, version-control, apply the desired state file for visibility and reproducibility.
 
-The default helmfile is `helmfile.yaml`:
+**Modules**: Modularize common patterns of your infrastructure, distribute it via Git, S3, etc. to be reused across the entire company (See [#648](https://github.com/roboll/helmfile/pull/648))
+
+**Versatility**: Manage your cluster consisting of charts, [kustomizations](https://github.com/kubernetes-sigs/kustomize), and directories of Kubernetes resources, turning everything to Helm releases (See [#673](https://github.com/roboll/helmfile/pull/673))
+
+**Patch**: JSON/Strategic-Merge Patch Kubernetes resources before `helm-install`ing, without forking upstream charts (See [#673](https://github.com/roboll/helmfile/pull/673))
+
+## Configuration
+
+**CAUTION**: This documentation is for the development version of Helmfile. If you are looking for the documentation for any of releases, please switch to the corresponding release tag like [v0.92.1](https://github.com/roboll/helmfile/tree/v0.92.1).
+
+The default name for a helmfile is `helmfile.yaml`:
 
 ```yaml
 # Chart repositories used from within this state file
@@ -35,37 +45,61 @@ The default helmfile is `helmfile.yaml`:
 # Use `helm-s3` and `helm-git` and whatever Helm Downloader plugins
 # to use repositories other than the official repository or one backend by chartmuseum.
 repositories:
-  - name: roboll
-    url: http://roboll.io/charts
-    certFile: optional_client_cert
-    keyFile: optional_client_key
-    username: optional_username
-    password: optional_password
+# To use official "stable" charts a.k.a https://github.com/helm/charts/tree/master/stable
+- name: stable
+  url: https://kubernetes-charts.storage.googleapis.com
+# To use official "incubator" charts a.k.a https://github.com/helm/charts/tree/master/incubator
+- name: incubator
+  url: https://kubernetes-charts-incubator.storage.googleapis.com
+# helm-git powered repository: You can treat any Git repository as a charts repository
+- name: polaris
+  url: git+https://github.com/reactiveops/polaris@deploy/helm?ref=master
+# Advanced configuration: You can setup basic or tls auth
+- name: roboll
+  url: http://roboll.io/charts
+  certFile: optional_client_cert
+  keyFile: optional_client_key
+  username: optional_username
+  password: optional_password
+# Advanced configuration: You can use a ca bundle to use an https repo
+# with a self-signed certificate
+- name: insecure
+   url: https://charts.my-insecure-domain.com
+   caFile: optional_ca_crt
 
 # context: kube-context # this directive is deprecated, please consider using helmDefaults.kubeContext
 
-#default values to set for args along with dedicated keys that can be set by contributers, cli args take precedence over these
+# Default values to set for args along with dedicated keys that can be set by contributors, cli args take precedence over these. 
+# In other words, unset values results in no flags passed to helm.
+# See the helm usage (helm SUBCOMMAND -h) for more info on default values when those flags aren't provided.
 helmDefaults:
   tillerNamespace: tiller-namespace  #dedicated default key for tiller-namespace
   tillerless: false                  #dedicated default key for tillerless
   kubeContext: kube-context          #dedicated default key for kube-context (--kube-context)
-  # additional and global args passed to helm
+  cleanupOnFail: false               #dedicated default key for helm flag --cleanup-on-fail
+  # additional and global args passed to helm (default "")
   args:
     - "--set k=v"
-  # defaults for verify, wait, force, timeout and recreatePods under releases[]
+  # verify the chart before upgrading (only works with packaged charts not directories) (default false)
   verify: true
+  # wait for k8s resources via --wait. (default false)
   wait: true
+  # time in seconds to wait for any individual Kubernetes operation (like Jobs for hooks, and waits on pod/pvc/svc/deployment readiness) (default 300)
   timeout: 600
+  # performs pods restart for the resource if applicable (default false)
   recreatePods: true
-  force: true
-  # enable TLS for request to Tiller
-  tls: true
+  # forces resource update through delete/recreate if needed (default false)
+  force: false
+  # enable TLS for request to Tiller (default false)
+  tls: true        
   # path to TLS CA certificate file (default "$HELM_HOME/ca.pem")
   tlsCACert: "path/to/ca.pem"
   # path to TLS certificate file (default "$HELM_HOME/cert.pem")
   tlsCert: "path/to/cert.pem"
   # path to TLS key file (default "$HELM_HOME/key.pem")
   tlsKey: "path/to/key.pem"
+  # limit the maximum number of revisions saved per release. Use 0 for no limit. (default 10) 
+  historyMax: 10
 
 # The desired states of Helm releases.
 #
@@ -74,16 +108,25 @@ releases:
   # Published chart example
   - name: vault                            # name of this release
     namespace: vault                       # target namespace
-    labels:                                  # Arbitrary key value pairs for filtering releases
+    labels:                                # Arbitrary key value pairs for filtering releases
       foo: bar
     chart: roboll/vault-secret-manager     # the chart being installed to create this release, referenced by `repository/chart` syntax
     version: ~1.24.1                       # the semver of the chart. range constraint is supported
     missingFileHandler: Warn # set to either "Error" or "Warn". "Error" instructs helmfile to fail when unable to find a values or secrets file. When "Warn", it prints the file and continues.
+    # Values files used for rendering the chart
     values:
-      # value files passed via --values
+      # Value files passed via --values
       - vault.yaml
-      # inline values, passed via a temporary values file and --values
+      # Inline values, passed via a temporary values file and --values, so that it doesn't suffer from type issues like --set
       - address: https://vault.example.com
+      # Go template available in inline values and values files.
+      - image:
+          # The end result is more or less YAML. So do `quote` to prevent number-like strings from accidentally parsed into numbers!
+          # See https://github.com/roboll/helmfile/issues/608
+          tag: {{ requiredEnv "IMAGE_TAG" | quote }}
+          # Otherwise:
+          #   tag: "{{ requiredEnv "IMAGE_TAG" }}"
+          #   tag: !!string {{ requiredEnv "IMAGE_TAG" }}
         db:
           username: {{ requiredEnv "DB_USERNAME" }}
           # value taken from environment variable. Quotes are necessary. Will throw an error if the environment variable is not set. $DB_PASSWORD needs to be set in the calling environment ex: export DB_PASSWORD='password1'
@@ -92,6 +135,8 @@ releases:
           # Interpolate environment variable with a fixed string
           domain: {{ requiredEnv "PLATFORM_ID" }}.my-domain.com
           scheme: {{ env "SCHEME" | default "https" }}
+    # Use `values` whenever possible!
+    # `set` translates to helm's `--set key=val`, that is known to suffer from type issues like https://github.com/roboll/helmfile/issues/608
     set:
     # single value loaded from a local file, translates to --set-file foo.config=path/to/file
     - name: foo.config
@@ -106,24 +151,24 @@ releases:
       value: {{ .Namespace }}
     # will attempt to decrypt it using helm-secrets plugin
     secrets:
-      - vault_secret.yaml
-    # wait for k8s resources via --wait. Defaults to `false`
-    wait: true
-    # time in seconds to wait for any individual Kubernetes operation (like Jobs for hooks, and waits on pod/pvc/svc/deployment readiness) (default 300)
-    timeout: 60
-    # performs pods restart for the resource if applicable
-    recreatePods: true
-    # forces resource update through delete/recreate if needed
-    force: true
-    # set `false` to uninstall on sync
+      - vault_secret.yaml    
+    # Override helmDefaults options for verify, wait, timeout, recreatePods and force. 
+    verify: true              
+    wait: true            
+    timeout: 60           
+    recreatePods: true    
+    force: false          
+    # set `false` to uninstall this release on sync.  (default true)
     installed: true
-    # restores previous state in case of failed release
-    atomic: true
-    # name of the tiller namespace
-    tillerNamespace: vault
-    # if true, will use the helm-tiller plugin
+    # restores previous state in case of failed release (default false)
+    atomic: true          
+    # when true, cleans up any new resources created during a failed release (default false)
+    cleanupOnFail: false  
+    # name of the tiller namespace (default "") 
+    tillerNamespace: vault  
+    # if true, will use the helm-tiller plugin (default false)
     tillerless: false
-    # enable TLS for request to Tiller
+    # enable TLS for request to Tiller (default false)
     tls: true
     # path to TLS CA certificate file (default "$HELM_HOME/ca.pem")
     tlsCACert: "path/to/ca.pem"
@@ -131,6 +176,13 @@ releases:
     tlsCert: "path/to/cert.pem"
     # path to TLS key file (default "$HELM_HOME/key.pem")
     tlsKey: "path/to/key.pem"
+    # --kube-context to be passed to helm commands
+    # CAUTION: this doesn't work as expected for `tilerless: true`.
+    # See https://github.com/roboll/helmfile/issues/642
+    # (default "", which means the standard kubeconfig, either ~/kubeconfig or the file pointed by $KUBECONFIG environment variable)
+    kubeContext: kube-context
+    # limit the maximum number of revisions saved per release. Use 0 for no limit (default 10)
+    historyMax: 10
 
   # Local chart example
   - name: grafana                            # name of this release
@@ -142,7 +194,34 @@ releases:
     wait: true
 
 #
-# Advanced Configuration: Helmfile Environments
+# Advanced Configuration: Nested States
+#
+helmfiles:
+- # Path to the helmfile state file being processed BEFORE releases in this state file
+  path: path/to/subhelmfile.yaml
+  # Label selector used for filtering releases in the nested state.
+  # For example, `name=prometheus` in this context is equivalent to processing the nested state like
+  #   helmfile -f path/to/subhelmfile.yaml -l name=prometheus sync
+  selectors:
+  - name=prometheus
+  # Override state values
+  values:
+  # Values files merged into the nested state's values
+  - additional.values.yaml
+  # One important aspect of using values here is that they first need to be defined in the values section
+  # of the origin helmfile, so in this example key1 needs to be in the values or environments.NAME.values of path/to/subhelmfile.yaml
+  # Inline state values merged into the nested state's values
+  - key1: val1
+- # All the nested state files under `helmfiles:` is processed in the order of definition.
+  # So it can be used for preparation for your main `releases`. An example would be creating CRDs required by `releases` in the parent state file.
+  path: path/to/mycrd.helmfile.yaml
+- # Terraform-module-like URL for importing a remote directory and use a file in it as a nested-state file
+  # The nested-state file is locally checked-out along with the remote directory containing it.
+  # Therefore all the local paths in the file are resolved relative to the file
+  path: git::https://github.com/cloudposse/helmfiles.git@releases/kiam.yaml?ref=0.40.0
+
+#
+# Advanced Configuration: Environments
 #
 
 # The list of environments managed by helmfile.
@@ -150,34 +229,58 @@ releases:
 # The default is `environments: {"default": {}}` which implies:
 #
 # - `{{ .Environment.Name }}` evaluates to "default"
-# - `{{ .Environment.Values }}` being empty
+# - `{{ .Values }}` being empty
 environments:
   # The "default" environment is available and used when `helmfile` is run without `--environment NAME`.
   default:
-    # Everything from the values.yaml is available via `{{ .Environment.Values.KEY }}`.
+    # Everything from the values.yaml is available via `{{ .Values.KEY }}`.
     # Suppose `{"foo": {"bar": 1}}` contained in the values.yaml below,
-    # `{{ .Environment.Values.foo.bar }}` is evaluated to `1`.
+    # `{{ .Values.foo.bar }}` is evaluated to `1`.
     values:
     - environments/default/values.yaml
+    # Each entry in values can be either a file path or inline values.
+    # The below is an example of inline values, which is merged to the `.Values`
+    - myChartVer: 1.0.0-dev
   # Any environment other than `default` is used only when `helmfile` is run with `--environment NAME`.
   # That is, the "production" env below is used when and only when it is run like `helmfile --environment production sync`.
   production:
     values:
     - environment/production/values.yaml
-    ## `secrets.yaml` is decrypted by `helm-secrets` and available via `{{ .Environment.Secrets.KEY }}`
+    - myChartVer: 1.0.0
+    ## `secrets.yaml` is decrypted by `helm-secrets` and available via `{{ .Environment.Values.KEY }}`
     secrets:
     - environment/production/secrets.yaml
-    # Overrides the `environmentDefaults.missingFileHandler` for this environment 
+    # Instructs helmfile to fail when unable to find a environment values file listed under `environments.NAME.values`.
+    #
+    # Possible values are  "Error", "Warn", "Info", "Debug". The default is "Error".
+    #
+    # Use "Warn", "Info", or "Debug" if you want helmfile to not fail when a values file is missing, while just leaving
+    # a message about the missing file at the log-level.
     missingFileHandler: Error
 
-environmentDefaults:
-  # Instructs helmfile to fail when unable to find a environment values file listed under `environments.NAME.values`.
-  #
-  # Possible values are  "Error", "Warn", "Info", "Debug". The default is "Error".
-  #
-  # Use "Warn", "Info", or "Debug" if you want helmfile to not fail when a values file is missing, while just leaving
-  # a message about the missing file at the log-level.
-  missingFileHandler: Error
+#
+# Advanced Configuration: Layering
+#
+# Helmfile merges all the "base" state files and this state file before processing.
+#
+# Assuming this state file is named `helmfile.yaml`, all the files are merged in the order of:
+#   environments.yaml <- defaults.yaml <- templates.yaml <- helmfile.yaml
+bases:
+- environments.yaml
+- defaults.yaml
+- templates.yaml
+
+#
+# Advanced Configuration: API Capabilities
+#
+# 'helmfile template' renders releases locally without querying an actual cluster,
+# and in this case `.Capabilities.APIVersions` cannot be populated.
+# When a chart queries for a specific CRD, this can lead to unexpected results.
+# 
+# Configure a fixed list of api versions to pass to 'helm template' via the --api-versions flag:
+apiVersions:
+- example/v1
+
 ```
 
 ## Templating
@@ -250,7 +353,7 @@ Congratulations! You now have your first Prometheus deployment running inside yo
 
 Iterate on the `helmfile.yaml` by referencing:
 
-- [Configuration syntax](#configuration-syntax)
+- [Configuration](#configuration)
 - [CLI reference](#cli-reference).
 - [Helmfile Best Practices Guide](https://github.com/roboll/helmfile/blob/master/docs/writing-helmfile.md)
 
@@ -258,15 +361,16 @@ Iterate on the `helmfile.yaml` by referencing:
 
 ```
 NAME:
-   helmfile -
+   helmfile
 
 USAGE:
    helmfile [global options] command [command options] [arguments...]
 
 VERSION:
-   v0.52.0
+   v0.92.1
 
 COMMANDS:
+     deps      update charts based on the contents of requirements.yaml
      repos     sync repositories from state file (helm repo add && helm repo update)
      charts    DEPRECATED: sync releases from state file (helm upgrade --install)
      diff      diff releases from state file against env (helm diff)
@@ -278,19 +382,26 @@ COMMANDS:
      delete    DEPRECATED: delete releases from state file (helm delete)
      destroy   deletes and then purges releases
      test      test releases from state file (helm test)
+     build     output compiled helmfile state(s) as YAML
+     list      list releases defined in state file
+     help, h   Shows a list of commands or help for one command
 
 GLOBAL OPTIONS:
-   --helm-binary value, -b value           path to helm binary
+   --helm-binary value, -b value           path to helm binary (default: "helm")
    --file helmfile.yaml, -f helmfile.yaml  load config from file or directory. defaults to helmfile.yaml or `helmfile.d`(means `helmfile.d/*.yaml`) in this preference
    --environment default, -e default       specify the environment name. defaults to default
+   --state-values-set value                set state values on the command line (can specify multiple or separate values with commas: key1=val1,key2=val2)
+   --state-values-file value               specify state values in a YAML file
    --quiet, -q                             Silence output. Equivalent to log-level warn
    --kube-context value                    Set kubectl context. Uses current context by default
+   --no-color                              Output without color
    --log-level value                       Set log level, default info
    --namespace value, -n value             Set namespace. Uses the namespace set in the context by default, and is available in templates as {{ .Namespace }}
    --selector value, -l value              Only run using the releases that match labels. Labels can take the form of foo=bar or foo!=bar.
                                            A release must match all labels in a group in order to be used. Multiple groups can be specified at once.
                                            --selector tier=frontend,tier!=proxy --selector tier=backend. Will match all frontend, non-proxy releases AND all backend releases.
                                            The name of a release can be used as a label. --selector name=myrelease
+   --allow-no-matching-release             Do not exit with an error code if the provided selector has no matching releases.
    --interactive, -i                       Request confirmation before attempting to modify clusters
    --help, -h                              show help
    --version, -v                           print the version
@@ -298,7 +409,7 @@ GLOBAL OPTIONS:
 
 ### sync
 
-The `helmfile sync` sub-command sync your cluster state as described in your `helmfile`. The default helmfile is `helmfile.yaml`, but any yaml file can be passed by specifying a `--file path/to/your/yaml/file` flag.
+The `helmfile sync` sub-command sync your cluster state as described in your `helmfile`. The default helmfile is `helmfile.yaml`, but any YAML file can be passed by specifying a `--file path/to/your/yaml/file` flag.
 
 Under the covers, Helmfile executes `helm upgrade --install` for each `release` declared in the manifest, by optionally decrypting [secrets](#secrets) to be consumed as helm chart values. It also updates specified chart repositories and updates the
 dependencies of any referenced local charts.
@@ -474,10 +585,10 @@ releases:
     namespace: {{ requiredEnv "NAME" }}
     chart: roboll/vault-secret-manager
     values:
-    - values.yaml.tmpl
+    - values.yaml.gotmpl
 ```
 
-`values.yaml.tmpl`:
+`values.yaml.gotmpl`:
 
 ```yaml
 db:
@@ -547,7 +658,7 @@ releaseName: prod
 `values.yaml.gotmpl`
 
 ```yaml
-domain: {{ .Environment.Values | getOrNil "my.domain" | default "dev.example.com" }}
+domain: {{ .Values | getOrNil "my.domain" | default "dev.example.com" }}
 ```
 
 `helmfile sync` installs `myapp` with the value `domain=dev.example.com`,
@@ -574,16 +685,25 @@ environments:
     - other.yaml.gotmpl  #  template directives with potential side-effects like `exec` and `readFile` will be honoured
 
 releases:
-- name: myapp-{{ .Environment.Values.releaseName }} # release name will be one of `dev` or `prod` depending on selected environment
+- name: myapp-{{ .Values.releaseName }} # release name will be one of `dev` or `prod` depending on selected environment
   values:
   - values.yaml.gotmpl
 
-{{ if eq (.Environment.Values.releaseName "prod" ) }}
+{{ if eq (.Values.releaseName "prod" ) }}
 # this release would be installed only if selected environment is `production`
 - name: production-specific-release
   ...
 {{ end }}
 ```
+
+### Note
+
+The `{{ .Values.foo }}` syntax is the recommended way of using environment values.
+
+Prior to this [pull request](https://github.com/roboll/helmfile/pull/647), environment values were made available through the `{{ .Environment.Values.foo }}` syntax.
+This is still working but is **deprecated** and the new `{{ .Values.foo }}` syntax should be used instead.
+
+You can read more infos about the feature proposal [here](https://github.com/roboll/helmfile/issues/640).
 
 ## Environment Secrets
 
@@ -619,7 +739,7 @@ releases:
 Then the environment secret `foo.bar` can be referenced by the below template expression in your `values.yaml.gotmpl`:
 
 ```yaml
-{{ .Environment.Values.foo.bar }}
+{{ .Values.foo.bar }}
 ```
 
 ## Tillerless
@@ -629,8 +749,49 @@ With the [helm-tiller](https://github.com/rimusz/helm-tiller) plugin installed, 
 To enable this mode, you need to define `tillerless: true` and set the `tillerNamespace` in the `helmDefaults` section
 or in the `releases` entries.
 
-Since every commands is run with `helm tiller run ...`, you have to disable concurrency. Otherwise you'll get
-mysterious errors about the tiller daemon.
+## DAG-aware installation/deletion ordering
+
+`needs` controls the order of the installation/deletion of the release:
+
+```yaml
+releases:
+- name: somerelease
+  needs:
+  - [TILLER_NAMESPACE/][NAMESPACE/]anotherelease
+```
+
+All the releases listed under `needs` are installed before(or deleted after) the release itself.
+
+For the following example, `helmfile [sync|apply]` installs releases in this order:
+
+1. logging
+2. servicemesh
+3. myapp1 and myapp2
+
+```yaml
+  - name: myapp1
+    chart: charts/myapp
+    needs:
+    - servicemesh
+    - logging
+  - name: myapp2
+    chart: charts/myapp
+    needs:
+    - servicemesh
+    - logging
+  - name: servicemesh
+    chart: charts/istio
+    needs:
+    - logging
+  - name: logging
+    chart: charts/fluentd
+```
+
+Note that all the releases in a same group is installed concurrently. That is, myapp1 and myapp2 are installed concurrently.
+
+On `helmfile [delete|destroy]`, deletions happen in the reverse order.
+
+That is, `myapp1` and `myapp2` are deleted first, then `servicemesh`, and finally `logging`.
 
 ## Separating helmfile.yaml into multiple independent files
 
@@ -703,19 +864,22 @@ Just run `helmfile sync` inside `myteam/`, and you are done.
 All the files are sorted alphabetically per group = array item inside `helmfiles:`, so that you have granular control over ordering, too.
 
 #### selectors
+
 When composing helmfiles you can use selectors from the command line as well as explicit selectors inside the parent helmfile to filter the releases to be used.
+
 ```yaml
 helmfiles:
 - apps/*/helmfile.yaml
 - path: apps/a-helmfile.yaml
-    selectors:          # list of selectors
-    - name=prometheus
-    - tier=frontend
+  selectors:          # list of selectors
+  - name=prometheus
+  - tier=frontend
 - path: apps/b-helmfile.yaml # no selector, so all releases are used
-    selectors: []
+selectors: []
 - path: apps/c-helmfile.yaml # parent selector to be used or cli selector for the initial helmfile
-    selectorsInherited: true
+  selectorsInherited: true
 ```
+
 * When a selector is specified, only this selector applies and the parents or CLI selectors are ignored.
 * When not selector is specified there are 2 modes for the selector inheritance because we would like to change the current inheritance behavior (see [issue #344](https://github.com/roboll/helmfile/issues/344)  ).
   * Legacy mode, sub-helmfiles without selectors inherit selectors from their parent helmfile. The initial helmfiles inherit from the command line selectors.
@@ -751,9 +915,10 @@ A Helmfile hook is a per-release extension point that is composed of:
 - `events`
 - `command`
 - `args`
+- `showlogs`
 
 Helmfile triggers various `events` while it is running.
-Once `events` are triggered, associated `hooks` are executed, by running the `command` with `args`.
+Once `events` are triggered, associated `hooks` are executed, by running the `command` with `args`. The standard output of the `command` will be displayed if `showlogs` is set and it's value is `true`.
 
 Currently supported `events` are:
 
@@ -779,6 +944,7 @@ releases:
   # *snip*
   hooks:
   - events: ["prepare", "cleanup"]
+    showlogs: true
     command: "echo"
     args: ["{{`{{.Environment.Name}}`}}", "{{`{{.Release.Name}}`}}", "{{`{{.HelmfileCommand}}`}}\
 "]
@@ -897,6 +1063,22 @@ Those features are set using the environment variable `HELMFILE_EXPERIMENTAL`. H
 * `explicit-selector-inheritance` : remove today implicit cli selectors inheritance for composed helmfiles, see [composition selector](#selectors)
 
 If you want to enable all experimental features set the env var to `HELMFILE_EXPERIMENTAL=true`
+
+## Azure ACR integration
+
+Azure offers helm repository [support for Azure Container Registry](https://docs.microsoft.com/en-us/azure/container-registry/container-registry-helm-repos) as a preview feature.
+
+To use this you must first `az login` and then `az acr helm repo add -n <MyRegistry>`. This will extract a token for the given ACR and configure `helm` to use it, e.g. `helm repo update` should work straight away.
+
+To use `helmfile` with ACR, on the other hand, you must either include a username/password in the repository definition for the ACR in your `helmfile.yaml` or use the `--skip-deps` switch, e.g. `helmfile template --skip-deps`.
+
+An ACR repository definition in `helmfile.yaml` looks like this:
+
+```
+repositories:
+  - name: <MyRegistry>
+    url: https://<MyRegistry>.azurecr.io/helm/v1/repo
+```
 
 ## Examples
 

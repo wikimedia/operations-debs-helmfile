@@ -1,23 +1,38 @@
 package app
 
 import (
+	"bufio"
+	"bytes"
 	"fmt"
+	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
+	"runtime"
+	"strings"
+	"sync"
 	"testing"
 
-	"github.com/roboll/helmfile/helmexec"
-	"github.com/roboll/helmfile/state"
+	"github.com/roboll/helmfile/pkg/exectest"
+	"gotest.tools/assert"
+
+	"github.com/roboll/helmfile/pkg/helmexec"
+	"github.com/roboll/helmfile/pkg/state"
+	"github.com/roboll/helmfile/pkg/testhelper"
+	"github.com/variantdev/vals"
+
+	"go.uber.org/zap"
 	"gotest.tools/env"
 )
 
 func appWithFs(app *App, files map[string]string) *App {
-	fs := state.NewTestFs(files)
+	fs := testhelper.NewTestFs(files)
 	return injectFs(app, fs)
 }
 
-func injectFs(app *App, fs *state.TestFs) *App {
+func injectFs(app *App, fs *testhelper.TestFs) *App {
 	app.readFile = fs.ReadFile
 	app.glob = fs.Glob
 	app.abs = fs.Abs
@@ -27,6 +42,16 @@ func injectFs(app *App, fs *state.TestFs) *App {
 	app.fileExists = fs.FileExists
 	app.directoryExistsAt = fs.DirectoryExistsAt
 	return app
+}
+
+func expectNoCallsToHelm(app *App) {
+	if app.helms != nil {
+		panic("invalid call to expectNoCallsToHelm")
+	}
+
+	app.helms = map[helmKey]helmexec.Interface{
+		createHelmKey(app.OverrideHelmBinary, app.OverrideKubeContext): &noCallHelmExec{},
+	}
 }
 
 func TestVisitDesiredStatesWithReleasesFiltered_ReleaseOrder(t *testing.T) {
@@ -52,17 +77,21 @@ releases:
   chart: stable/grafana
 `,
 	}
-	fs := state.NewTestFs(files)
+	fs := testhelper.NewTestFs(files)
 	fs.GlobFixtures["/path/to/helmfile.d/a*.yaml"] = []string{"/path/to/helmfile.d/a2.yaml", "/path/to/helmfile.d/a1.yaml"}
 	app := &App{
-		KubeContext: "default",
-		Logger:      helmexec.NewLogger(os.Stderr, "debug"),
-		Namespace:   "",
-		Env:         "default",
+		OverrideHelmBinary:  DefaultHelmBinary,
+		OverrideKubeContext: "default",
+		Logger:              helmexec.NewLogger(os.Stderr, "debug"),
+		Namespace:           "",
+		Env:                 "default",
 	}
+
+	expectNoCallsToHelm(app)
+
 	app = injectFs(app, fs)
 	actualOrder := []string{}
-	noop := func(st *state.HelmState, helm helmexec.Interface) []error {
+	noop := func(st *state.HelmState) []error {
 		actualOrder = append(actualOrder, st.FilePath)
 		return []error{}
 	}
@@ -98,16 +127,20 @@ BAR: 2
 BAZ: 4
 `,
 	}
-	fs := state.NewTestFs(files)
+	fs := testhelper.NewTestFs(files)
 	fs.GlobFixtures["/path/to/env.*.yaml"] = []string{"/path/to/env.2.yaml", "/path/to/env.1.yaml"}
 	app := &App{
-		KubeContext: "default",
-		Logger:      helmexec.NewLogger(os.Stderr, "debug"),
-		Namespace:   "",
-		Env:         "default",
+		OverrideHelmBinary:  DefaultHelmBinary,
+		OverrideKubeContext: "default",
+		Logger:              helmexec.NewLogger(os.Stderr, "debug"),
+		Namespace:           "",
+		Env:                 "default",
 	}
+
+	expectNoCallsToHelm(app)
+
 	app = injectFs(app, fs)
-	noop := func(st *state.HelmState, helm helmexec.Interface) []error {
+	noop := func(st *state.HelmState) []error {
 		return []error{}
 	}
 
@@ -137,15 +170,19 @@ releases:
   chart: stable/zipkin
 `,
 	}
-	fs := state.NewTestFs(files)
+	fs := testhelper.NewTestFs(files)
 	app := &App{
-		KubeContext: "default",
-		Logger:      helmexec.NewLogger(os.Stderr, "debug"),
-		Namespace:   "",
-		Env:         "default",
+		OverrideHelmBinary:  DefaultHelmBinary,
+		OverrideKubeContext: "default",
+		Logger:              helmexec.NewLogger(os.Stderr, "debug"),
+		Namespace:           "",
+		Env:                 "default",
 	}
+
+	expectNoCallsToHelm(app)
+
 	app = injectFs(app, fs)
-	noop := func(st *state.HelmState, helm helmexec.Interface) []error {
+	noop := func(st *state.HelmState) []error {
 		return []error{}
 	}
 
@@ -156,9 +193,49 @@ releases:
 		t.Fatal("expected error did not occur")
 	}
 
-	expected := "in ./helmfile.yaml: failed to read helmfile.yaml: environment values file matching \"env.*.yaml\" does not exist"
+	expected := "in ./helmfile.yaml: failed to read helmfile.yaml: environment values file matching \"env.*.yaml\" does not exist in \".\""
 	if err.Error() != expected {
 		t.Errorf("unexpected error: expected=%s, got=%v", expected, err)
+	}
+}
+
+func TestVisitDesiredStatesWithReleasesFiltered_Issue1008_MissingNonDefaultEnvInBase(t *testing.T) {
+	files := map[string]string{
+		"/path/to/base.yaml": `
+helmDefaults:
+  wait: true
+`,
+		"/path/to/helmfile.yaml": `
+bases:
+- base.yaml
+environments:
+  test:
+releases:
+- name: zipkin
+  chart: stable/zipkin
+`,
+	}
+	fs := testhelper.NewTestFs(files)
+	app := &App{
+		OverrideHelmBinary:  DefaultHelmBinary,
+		OverrideKubeContext: "default",
+		Logger:              helmexec.NewLogger(os.Stderr, "debug"),
+		Namespace:           "",
+		Env:                 "test",
+	}
+
+	expectNoCallsToHelm(app)
+
+	app = injectFs(app, fs)
+	noop := func(st *state.HelmState) []error {
+		return []error{}
+	}
+
+	err := app.VisitDesiredStatesWithReleasesFiltered(
+		"helmfile.yaml", noop,
+	)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
 	}
 }
 
@@ -190,15 +267,19 @@ releases:
   chart: stable/zipkin
 `, testcase.handler, testcase.filePattern),
 			}
-			fs := state.NewTestFs(files)
+			fs := testhelper.NewTestFs(files)
 			app := &App{
-				KubeContext: "default",
-				Logger:      helmexec.NewLogger(os.Stderr, "debug"),
-				Namespace:   "",
-				Env:         "default",
+				OverrideHelmBinary:  DefaultHelmBinary,
+				OverrideKubeContext: "default",
+				Logger:              helmexec.NewLogger(os.Stderr, "debug"),
+				Namespace:           "",
+				Env:                 "default",
 			}
+
+			expectNoCallsToHelm(app)
+
 			app = injectFs(app, fs)
-			noop := func(st *state.HelmState, helm helmexec.Interface) []error {
+			noop := func(st *state.HelmState) []error {
 				return []error{}
 			}
 
@@ -251,17 +332,21 @@ releases:
 	}
 
 	for _, testcase := range testcases {
-		fs := state.NewTestFs(files)
+		fs := testhelper.NewTestFs(files)
 		fs.GlobFixtures["/path/to/helmfile.d/a*.yaml"] = []string{"/path/to/helmfile.d/a2.yaml", "/path/to/helmfile.d/a1.yaml"}
 		app := &App{
-			KubeContext: "default",
-			Logger:      helmexec.NewLogger(os.Stderr, "debug"),
-			Selectors:   []string{fmt.Sprintf("name=%s", testcase.name)},
-			Namespace:   "",
-			Env:         "default",
+			OverrideHelmBinary:  DefaultHelmBinary,
+			OverrideKubeContext: "default",
+			Logger:              helmexec.NewLogger(os.Stderr, "debug"),
+			Selectors:           []string{fmt.Sprintf("name=%s", testcase.name)},
+			Namespace:           "",
+			Env:                 "default",
 		}
+
+		expectNoCallsToHelm(app)
+
 		app = injectFs(app, fs)
-		noop := func(st *state.HelmState, helm helmexec.Interface) []error {
+		noop := func(st *state.HelmState) []error {
 			return []error{}
 		}
 
@@ -295,7 +380,7 @@ releases:
   chart: stable/zipkin
 `,
 	}
-	noop := func(st *state.HelmState, helm helmexec.Interface) []error {
+	noop := func(st *state.HelmState) []error {
 		return []error{}
 	}
 
@@ -310,12 +395,16 @@ releases:
 
 	for _, testcase := range testcases {
 		app := appWithFs(&App{
-			KubeContext: "default",
-			Logger:      helmexec.NewLogger(os.Stderr, "debug"),
-			Namespace:   "",
-			Selectors:   []string{},
-			Env:         testcase.name,
+			OverrideHelmBinary:  DefaultHelmBinary,
+			OverrideKubeContext: "default",
+			Logger:              helmexec.NewLogger(os.Stderr, "debug"),
+			Namespace:           "",
+			Selectors:           []string{},
+			Env:                 testcase.name,
 		}, files)
+
+		expectNoCallsToHelm(app)
+
 		err := app.VisitDesiredStatesWithReleasesFiltered(
 			"helmfile.yaml", noop,
 		)
@@ -325,6 +414,14 @@ releases:
 			t.Errorf("unexpected error for environment=%s: %v", testcase.name, err)
 		}
 	}
+}
+
+type ctxLogger struct {
+	label string
+}
+
+func (cl *ctxLogger) Write(b []byte) (int, error) {
+	return os.Stderr.Write(append([]byte(cl.label+":"), b...))
 }
 
 // See https://github.com/roboll/helmfile/issues/322
@@ -387,39 +484,46 @@ releases:
 		{label: "duplicatedOK=yes", expectedCount: 2, expectErr: false},
 	}
 
-	for _, testcase := range testcases {
-		actual := []string{}
+	for i := range testcases {
+		testcase := testcases[i]
 
-		collectReleases := func(st *state.HelmState, helm helmexec.Interface) []error {
-			for _, r := range st.Releases {
-				actual = append(actual, r.Name)
+		t.Run(testcase.label, func(t *testing.T) {
+			actual := []string{}
+
+			collectReleases := func(st *state.HelmState) []error {
+				for _, r := range st.Releases {
+					actual = append(actual, r.Name)
+				}
+				return []error{}
 			}
-			return []error{}
-		}
 
-		app := appWithFs(&App{
-			KubeContext: "default",
-			Logger:      helmexec.NewLogger(os.Stderr, "debug"),
-			Namespace:   "",
-			Selectors:   []string{testcase.label},
-			Env:         "default",
-		}, files)
+			app := appWithFs(&App{
+				OverrideHelmBinary:  DefaultHelmBinary,
+				OverrideKubeContext: "default",
+				Logger:              helmexec.NewLogger(&ctxLogger{label: testcase.label}, "debug"),
+				Namespace:           "",
+				Selectors:           []string{testcase.label},
+				Env:                 "default",
+			}, files)
 
-		err := app.VisitDesiredStatesWithReleasesFiltered(
-			"helmfile.yaml", collectReleases,
-		)
-		if testcase.expectErr {
-			if err == nil {
-				t.Errorf("error expected but not happened for selector %s", testcase.label)
-			} else if err.Error() != testcase.errMsg {
-				t.Errorf("unexpected error message: expected=\"%s\", actual=\"%s\"", testcase.errMsg, err.Error())
+			expectNoCallsToHelm(app)
+
+			err := app.VisitDesiredStatesWithReleasesFiltered(
+				"helmfile.yaml", collectReleases,
+			)
+			if testcase.expectErr {
+				if err == nil {
+					t.Errorf("error expected but not happened for selector %s", testcase.label)
+				} else if err.Error() != testcase.errMsg {
+					t.Errorf("unexpected error message: expected=\"%s\", actual=\"%s\"", testcase.errMsg, err.Error())
+				}
+			} else if !testcase.expectErr && err != nil {
+				t.Errorf("unexpected error for selector %s: %v", testcase.label, err)
 			}
-		} else if !testcase.expectErr && err != nil {
-			t.Errorf("unexpected error for selector %s: %v", testcase.label, err)
-		}
-		if len(actual) != testcase.expectedCount {
-			t.Errorf("unexpected release count for selector %s: expected=%d, actual=%d", testcase.label, testcase.expectedCount, len(actual))
-		}
+			if len(actual) != testcase.expectedCount {
+				t.Errorf("unexpected release count for selector %s: expected=%d, actual=%d", testcase.label, testcase.expectedCount, len(actual))
+			}
+		})
 	}
 }
 
@@ -429,8 +533,8 @@ func TestVisitDesiredStatesWithReleasesFiltered_EmbeddedSelectors(t *testing.T) 
 helmfiles:
 - path: helmfile.d/a*.yaml
   selectors:
-  - name=prometheus      
-  - name=zipkin      
+  - name=prometheus
+  - name=zipkin
 - helmfile.d/b*.yaml
 - path: helmfile.d/c*.yaml
   selectors: []
@@ -625,7 +729,7 @@ func runFilterSubHelmFilesTests(testcases []struct {
 	for _, testcase := range testcases {
 		actual := []string{}
 
-		collectReleases := func(st *state.HelmState, helm helmexec.Interface) []error {
+		collectReleases := func(st *state.HelmState) []error {
 			for _, r := range st.Releases {
 				actual = append(actual, r.Name)
 			}
@@ -633,12 +737,15 @@ func runFilterSubHelmFilesTests(testcases []struct {
 		}
 
 		app := appWithFs(&App{
-			KubeContext: "default",
-			Logger:      helmexec.NewLogger(os.Stderr, "debug"),
-			Namespace:   "",
-			Selectors:   []string{testcase.label},
-			Env:         "default",
+			OverrideHelmBinary:  DefaultHelmBinary,
+			OverrideKubeContext: "default",
+			Logger:              helmexec.NewLogger(os.Stderr, "debug"),
+			Namespace:           "",
+			Selectors:           []string{testcase.label},
+			Env:                 "default",
 		}, files)
+
+		expectNoCallsToHelm(app)
 
 		err := app.VisitDesiredStatesWithReleasesFiltered(
 			"helmfile.yaml", collectReleases,
@@ -657,6 +764,123 @@ func runFilterSubHelmFilesTests(testcases []struct {
 		}
 	}
 
+}
+
+func TestVisitDesiredStatesWithReleasesFiltered_EmbeddedNestedStateAdditionalEnvValues(t *testing.T) {
+	files := map[string]string{
+		"/path/to/helmfile.yaml": `
+helmfiles:
+- path: helmfile.d/a*.yaml
+  values:
+  - env.values.yaml
+- helmfile.d/b*.yaml
+- path: helmfile.d/c*.yaml
+  values:
+  - env.values.yaml
+  - tillerNs: INLINE_TILLER_NS_3
+`,
+		"/path/to/helmfile.d/a1.yaml": `
+environments:
+  default:
+    values:
+    - tillerNs: INLINE_TILLER_NS
+      ns: INLINE_NS
+releases:
+- name: foo
+  chart: stable/zipkin
+  tillerNamespace: {{ .Environment.Values.tillerNs }}
+  namespace: {{ .Environment.Values.ns }}
+`,
+		"/path/to/helmfile.d/b.yaml": `
+environments:
+  default:
+    values:
+    - tillerNs: INLINE_TILLER_NS
+      ns: INLINE_NS
+releases:
+- name: bar
+  chart: stable/grafana
+  tillerNamespace:  {{ .Environment.Values.tillerNs }}
+  namespace: {{ .Environment.Values.ns }}
+`,
+		"/path/to/helmfile.d/c.yaml": `
+environments:
+  default:
+    values:
+    - tillerNs: INLINE_TILLER_NS
+      ns: INLINE_NS
+releases:
+- name: baz
+  chart: stable/envoy
+  tillerNamespace: {{ .Environment.Values.tillerNs }}
+  namespace: {{ .Environment.Values.ns }}
+`,
+		"/path/to/env.values.yaml": `
+tillerNs: INLINE_TILLER_NS_2
+`,
+	}
+
+	app := appWithFs(&App{
+		OverrideHelmBinary:  DefaultHelmBinary,
+		OverrideKubeContext: "default",
+		Logger:              helmexec.NewLogger(os.Stderr, "debug"),
+		Namespace:           "",
+		Selectors:           []string{},
+		Env:                 "default",
+	}, files)
+
+	expectNoCallsToHelm(app)
+
+	processed := []state.ReleaseSpec{}
+
+	collectReleases := func(st *state.HelmState) []error {
+		for _, r := range st.Releases {
+			processed = append(processed, r)
+		}
+		return []error{}
+	}
+
+	err := app.VisitDesiredStatesWithReleasesFiltered(
+		"helmfile.yaml", collectReleases,
+	)
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	type release struct {
+		chart    string
+		tillerNs string
+		ns       string
+	}
+
+	expectedReleases := map[string]release{
+		"foo": {"stable/zipkin", "INLINE_TILLER_NS_2", "INLINE_NS"},
+		"bar": {"stable/grafana", "INLINE_TILLER_NS", "INLINE_NS"},
+		"baz": {"stable/envoy", "INLINE_TILLER_NS_3", "INLINE_NS"},
+	}
+
+	for name := range processed {
+		actual := processed[name]
+		t.Run(actual.Name, func(t *testing.T) {
+			expected, ok := expectedReleases[actual.Name]
+			if !ok {
+				t.Fatalf("unexpected release processed: %v", actual)
+			}
+
+			if expected.chart != actual.Chart {
+				t.Errorf("unexpected chart: expected=%s, got=%s", expected.chart, actual.Chart)
+			}
+
+			if expected.tillerNs != actual.TillerNamespace {
+				t.Errorf("unexpected tiller namespace: expected=%s, got=%s", expected.tillerNs, actual.TillerNamespace)
+			}
+
+			if expected.ns != actual.Namespace {
+				t.Errorf("unexpected namespace: expected=%s, got=%s", expected.ns, actual.Namespace)
+			}
+		})
+	}
 }
 
 // See https://github.com/roboll/helmfile/issues/312
@@ -698,22 +922,26 @@ releases:
 	for _, testcase := range testcases {
 		actual := []string{}
 
-		collectReleases := func(st *state.HelmState, helm helmexec.Interface) []error {
+		collectReleases := func(st *state.HelmState) []error {
 			for _, r := range st.Releases {
 				actual = append(actual, r.Name)
 			}
 			return []error{}
 		}
 		app := appWithFs(&App{
-			KubeContext: "default",
-			Logger:      helmexec.NewLogger(os.Stderr, "debug"),
-			Reverse:     testcase.reverse,
-			Namespace:   "",
-			Selectors:   []string{},
-			Env:         "default",
+			OverrideHelmBinary:  DefaultHelmBinary,
+			OverrideKubeContext: "default",
+			Logger:              helmexec.NewLogger(os.Stderr, "debug"),
+			Namespace:           "",
+			Selectors:           []string{},
+			Env:                 "default",
 		}, files)
+
+		expectNoCallsToHelm(app)
+
 		err := app.VisitDesiredStatesWithReleasesFiltered(
 			"helmfile.yaml", collectReleases,
+			SetReverse(testcase.reverse),
 		)
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
@@ -721,6 +949,297 @@ releases:
 		if !reflect.DeepEqual(testcase.expected, actual) {
 			t.Errorf("releases did not match: expected=%v actual=%v", expected, actual)
 		}
+	}
+}
+
+func TestVisitDesiredStatesWithReleasesFiltered_EnvironmentValueOverrides(t *testing.T) {
+	files := map[string]string{
+		"/path/to/helmfile.yaml": `
+environments:
+  default:
+    values:
+    - values.yaml
+---
+releases:
+- name: {{ .Environment.Values.foo }}-{{ .Environment.Values.bar }}-{{ .Environment.Values.baz }}
+  chart: stable/zipkin
+`,
+		"/path/to/values.yaml": `
+foo: foo
+bar: bar
+baz: baz
+`,
+		"/path/to/overrides.yaml": `
+foo: "foo1"
+bar: "bar1"
+`,
+	}
+
+	testcases := []struct {
+		expected string
+	}{
+		{expected: "foo1-bar2-baz1"},
+	}
+	for _, testcase := range testcases {
+		actual := []string{}
+
+		collectReleases := func(st *state.HelmState) []error {
+			for _, r := range st.Releases {
+				actual = append(actual, r.Name)
+			}
+			return []error{}
+		}
+		app := appWithFs(&App{
+			OverrideHelmBinary:  DefaultHelmBinary,
+			OverrideKubeContext: "default",
+			Logger:              helmexec.NewLogger(os.Stderr, "debug"),
+			Namespace:           "",
+			Selectors:           []string{},
+			Env:                 "default",
+			ValuesFiles:         []string{"overrides.yaml"},
+			Set:                 map[string]interface{}{"bar": "bar2", "baz": "baz1"},
+		}, files)
+
+		expectNoCallsToHelm(app)
+
+		err := app.VisitDesiredStatesWithReleasesFiltered(
+			"helmfile.yaml", collectReleases,
+		)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(actual) != 1 {
+			t.Errorf("unexpected number of processed releases: expected=1, got=%d", len(actual))
+		}
+		if actual[0] != testcase.expected {
+			t.Errorf("unexpected result: expected=%s, got=%s", testcase.expected, actual[0])
+		}
+	}
+}
+
+func TestVisitDesiredStatesWithReleasesFiltered_StateValueOverrides(t *testing.T) {
+	envTmplExpr := "{{ .Values.x.foo }}-{{ .Values.x.bar }}-{{ .Values.x.baz }}-{{ .Values.x.hoge }}-{{ .Values.x.fuga }}-{{ .Values.x.a | first | pluck \"b\" | first | first | pluck \"c\" | first }}"
+	relTmplExpr := "\"{{`{{ .Values.x.foo }}-{{ .Values.x.bar }}-{{ .Values.x.baz }}-{{ .Values.x.hoge }}-{{ .Values.x.fuga }}-{{ .Values.x.a | first | pluck \\\"b\\\" | first | first | pluck \\\"c\\\" | first }}`}}\""
+
+	testcases := []struct {
+		expr, env, expected string
+	}{
+		{
+			expr:     envTmplExpr,
+			env:      "default",
+			expected: "foo-bar_default-baz_override-hoge_set-fuga_set-C",
+		},
+		{
+			expr:     envTmplExpr,
+			env:      "production",
+			expected: "foo-bar_production-baz_override-hoge_set-fuga_set-C",
+		},
+		{
+			expr:     relTmplExpr,
+			env:      "default",
+			expected: "foo-bar_default-baz_override-hoge_set-fuga_set-C",
+		},
+		{
+			expr:     relTmplExpr,
+			env:      "production",
+			expected: "foo-bar_production-baz_override-hoge_set-fuga_set-C",
+		},
+	}
+	for i := range testcases {
+		testcase := testcases[i]
+		t.Run(fmt.Sprintf("case %d", i), func(t *testing.T) {
+			files := map[string]string{
+				"/path/to/helmfile.yaml": fmt.Sprintf(`
+# The top-level "values" are "base" values has inherited to state values with the lowest priority.
+# The lowest priority results in environment-specific values to override values defined in the base.
+values:
+- values.yaml
+
+environments:
+  default:
+    values:
+    - default.yaml
+  production:
+    values:
+    - production.yaml
+---
+releases:
+- name: %s
+  chart: %s
+  namespace: %s
+`, testcase.expr, testcase.expr, testcase.expr),
+				"/path/to/values.yaml": `
+x:
+  foo: foo
+  bar: bar
+  baz: baz
+  hoge: hoge
+  fuga: fuga
+  a: []
+`,
+				"/path/to/default.yaml": `
+x:
+  bar: "bar_default"
+  baz: "baz_default"
+  a:
+  - b: []
+`,
+				"/path/to/production.yaml": `
+x:
+  bar: "bar_production"
+  baz: "baz_production"
+  a:
+  - b: []
+`,
+				"/path/to/overrides.yaml": `
+x:
+  baz: baz_override
+  hoge: hoge_override
+  a:
+  - b:
+    - c: C
+`,
+			}
+
+			actual := []state.ReleaseSpec{}
+
+			collectReleases := func(st *state.HelmState) []error {
+				for _, r := range st.Releases {
+					actual = append(actual, r)
+				}
+				return []error{}
+			}
+			app := appWithFs(&App{
+				OverrideHelmBinary:  DefaultHelmBinary,
+				OverrideKubeContext: "default",
+				Logger:              helmexec.NewLogger(os.Stderr, "debug"),
+				Namespace:           "",
+				Selectors:           []string{},
+				Env:                 testcase.env,
+				ValuesFiles:         []string{"overrides.yaml"},
+				Set:                 map[string]interface{}{"x": map[string]interface{}{"hoge": "hoge_set", "fuga": "fuga_set"}},
+			}, files)
+
+			expectNoCallsToHelm(app)
+
+			err := app.VisitDesiredStatesWithReleasesFiltered(
+				"helmfile.yaml", collectReleases,
+			)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(actual) != 1 {
+				t.Errorf("unexpected number of processed releases: expected=1, got=%d", len(actual))
+			}
+			if actual[0].Name != testcase.expected {
+				t.Errorf("unexpected name: expected=%s, got=%s", testcase.expected, actual[0].Name)
+			}
+			if actual[0].Chart != testcase.expected {
+				t.Errorf("unexpected chart: expected=%s, got=%s", testcase.expected, actual[0].Chart)
+			}
+			if actual[0].Namespace != testcase.expected {
+				t.Errorf("unexpected namespace: expected=%s, got=%s", testcase.expected, actual[0].Namespace)
+			}
+		})
+	}
+}
+
+func TestVisitDesiredStatesWithReleasesFiltered_ChartAtAbsPath(t *testing.T) {
+	files := map[string]string{
+		"/path/to/helmfile.yaml": `
+releases:
+- name: myapp
+  chart: /path/to/mychart
+`,
+	}
+
+	actual := []state.ReleaseSpec{}
+
+	collectReleases := func(st *state.HelmState) []error {
+		for _, r := range st.Releases {
+			actual = append(actual, r)
+		}
+		return []error{}
+	}
+	app := appWithFs(&App{
+		OverrideHelmBinary:  DefaultHelmBinary,
+		OverrideKubeContext: "default",
+		Logger:              helmexec.NewLogger(os.Stderr, "debug"),
+		Namespace:           "",
+		Env:                 "default",
+		Selectors:           []string{},
+	}, files)
+
+	expectNoCallsToHelm(app)
+
+	err := app.VisitDesiredStatesWithReleasesFiltered(
+		"helmfile.yaml", collectReleases,
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(actual) != 1 {
+		t.Errorf("unexpected number of processed releases: expected=1, got=%d", len(actual))
+	}
+	if actual[0].Name != "myapp" {
+		t.Errorf("unexpected name: expected=%s, got=%s", "myapp", actual[0].Name)
+	}
+	if actual[0].Chart != "/path/to/mychart" {
+		t.Errorf("unexpected chart: expected=%s, got=%s", "/path/to/mychart", actual[0].Chart)
+	}
+}
+
+func TestVisitDesiredStatesWithReleasesFiltered_RemoteTgzAsChart(t *testing.T) {
+	testcases := []struct {
+		expr, env, expected string
+	}{
+		{
+			expected: "https://github.com/arangodb/kube-arangodb/releases/download/0.3.11/kube-arangodb-crd.tgz",
+		},
+	}
+	for i := range testcases {
+		testcase := testcases[i]
+		t.Run(fmt.Sprintf("case %d", i), func(t *testing.T) {
+			files := map[string]string{
+				"/path/to/helmfile.yaml": `
+releases:
+  - name: arangodb-crd
+    chart: https://github.com/arangodb/kube-arangodb/releases/download/0.3.11/kube-arangodb-crd.tgz
+`,
+			}
+
+			actual := []state.ReleaseSpec{}
+
+			collectReleases := func(st *state.HelmState) []error {
+				for _, r := range st.Releases {
+					actual = append(actual, r)
+				}
+				return []error{}
+			}
+			app := appWithFs(&App{
+				OverrideHelmBinary:  DefaultHelmBinary,
+				OverrideKubeContext: "default",
+				Logger:              helmexec.NewLogger(os.Stderr, "debug"),
+				Namespace:           "",
+				Selectors:           []string{},
+				Env:                 "default",
+			}, files)
+
+			expectNoCallsToHelm(app)
+
+			err := app.VisitDesiredStatesWithReleasesFiltered(
+				"helmfile.yaml", collectReleases,
+			)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(actual) != 1 {
+				t.Errorf("unexpected number of processed releases: expected=1, got=%d", len(actual))
+			}
+			if actual[0].Chart != testcase.expected {
+				t.Errorf("unexpected chart: expected=%s, got=%s", testcase.expected, actual[0].Chart)
+			}
+		})
 	}
 }
 
@@ -744,13 +1263,17 @@ func TestLoadDesiredStateFromYaml_DuplicateReleaseName(t *testing.T) {
 		return yamlContent, nil
 	}
 	app := &App{
-		readFile:    readFile,
-		glob:        filepath.Glob,
-		abs:         filepath.Abs,
-		KubeContext: "default",
-		Env:         "default",
-		Logger:      helmexec.NewLogger(os.Stderr, "debug"),
+		OverrideHelmBinary:  DefaultHelmBinary,
+		OverrideKubeContext: "default",
+		readFile:            readFile,
+		glob:                filepath.Glob,
+		abs:                 filepath.Abs,
+		Env:                 "default",
+		Logger:              helmexec.NewLogger(os.Stderr, "debug"),
 	}
+
+	expectNoCallsToHelm(app)
+
 	_, err := app.loadDesiredStateFromYaml(yamlFile)
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
@@ -777,7 +1300,7 @@ releases:
     stage: post
   <<: *default
 `
-	testFs := state.NewTestFs(map[string]string{
+	testFs := testhelper.NewTestFs(map[string]string{
 		yamlFile: yamlContent,
 		"/path/to/base.yaml": `environments:
   default:
@@ -801,15 +1324,19 @@ helmDefaults:
 `,
 	})
 	app := &App{
-		readFile:     testFs.ReadFile,
-		glob:         testFs.Glob,
-		abs:          testFs.Abs,
-		fileExistsAt: testFs.FileExistsAt,
-		fileExists:   testFs.FileExists,
-		KubeContext:  "default",
-		Env:          "default",
-		Logger:       helmexec.NewLogger(os.Stderr, "debug"),
+		OverrideHelmBinary:  DefaultHelmBinary,
+		OverrideKubeContext: "default",
+		readFile:            testFs.ReadFile,
+		glob:                testFs.Glob,
+		abs:                 testFs.Abs,
+		fileExistsAt:        testFs.FileExistsAt,
+		fileExists:          testFs.FileExists,
+		Env:                 "default",
+		Logger:              helmexec.NewLogger(os.Stderr, "debug"),
 	}
+
+	expectNoCallsToHelm(app)
+
 	st, err := app.loadDesiredStateFromYaml(yamlFile)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -825,6 +1352,10 @@ helmDefaults:
 
 	if st.Releases[1].Values[0] != "{{`{{.Release.Name}}`}}/values.yaml" {
 		t.Errorf("unexpected releases[0].missingFileHandler: expected={{`{{.Release.Name}}`}}/values.yaml, got=%s", st.Releases[1].Values[0])
+	}
+
+	if st.FilePath != yamlFile {
+		t.Errorf("unexpected filePath: expected=%s, got=%s", yamlFile, st.FilePath)
 	}
 }
 
@@ -858,7 +1389,7 @@ releases:
     stage: post
   <<: *default
 `
-	testFs := state.NewTestFs(map[string]string{
+	testFs := testhelper.NewTestFs(map[string]string{
 		yamlFile: yamlContent,
 		"/path/to/base.yaml": `environments:
   default:
@@ -882,13 +1413,17 @@ helmDefaults:
 `,
 	})
 	app := &App{
-		readFile:   testFs.ReadFile,
-		fileExists: testFs.FileExists,
-		glob:       testFs.Glob,
-		abs:        testFs.Abs,
-		Env:        "default",
-		Logger:     helmexec.NewLogger(os.Stderr, "debug"),
+		OverrideHelmBinary: DefaultHelmBinary,
+		readFile:           testFs.ReadFile,
+		fileExists:         testFs.FileExists,
+		glob:               testFs.Glob,
+		abs:                testFs.Abs,
+		Env:                "default",
+		Logger:             helmexec.NewLogger(os.Stderr, "debug"),
 	}
+
+	expectNoCallsToHelm(app)
+
 	st, err := app.loadDesiredStateFromYaml(yamlFile)
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
@@ -897,25 +1432,23 @@ helmDefaults:
 	if st.HelmDefaults.TillerNamespace != "TILLER_NS" {
 		t.Errorf("unexpected helmDefaults.tillerNamespace: expected=TILLER_NS, got=%s", st.HelmDefaults.TillerNamespace)
 	}
-
-	if st.Releases[0].Name != "myrelease0" {
-		t.Errorf("unexpected releases[0].name: expected=myrelease0, got=%s", st.Releases[0].Name)
+	firstRelease := st.Releases[0]
+	if firstRelease.Name != "myrelease1" {
+		t.Errorf("unexpected releases[1].name: expected=myrelease1, got=%s", firstRelease.Name)
 	}
-	if st.Releases[1].Name != "myrelease1" {
-		t.Errorf("unexpected releases[1].name: expected=myrelease1, got=%s", st.Releases[1].Name)
+	secondRelease := st.Releases[1]
+	if secondRelease.Name != "myrelease1" {
+		t.Errorf("unexpected releases[2].name: expected=myrelease1, got=%s", secondRelease.Name)
 	}
-	if st.Releases[2].Name != "myrelease1" {
-		t.Errorf("unexpected releases[2].name: expected=myrelease1, got=%s", st.Releases[2].Name)
+	if secondRelease.Values[0] != "{{`{{.Release.Name}}`}}/values.yaml" {
+		t.Errorf("unexpected releases[2].missingFileHandler: expected={{`{{.Release.Name}}`}}/values.yaml, got=%s", firstRelease.Values[0])
 	}
-	if st.Releases[2].Values[0] != "{{`{{.Release.Name}}`}}/values.yaml" {
-		t.Errorf("unexpected releases[2].missingFileHandler: expected={{`{{.Release.Name}}`}}/values.yaml, got=%s", st.Releases[1].Values[0])
-	}
-	if *st.Releases[2].MissingFileHandler != "Warn" {
-		t.Errorf("unexpected releases[2].missingFileHandler: expected=Warn, got=%s", *st.Releases[1].MissingFileHandler)
+	if *secondRelease.MissingFileHandler != "Warn" {
+		t.Errorf("unexpected releases[2].missingFileHandler: expected=Warn, got=%s", *firstRelease.MissingFileHandler)
 	}
 
-	if st.Releases[2].Values[0] != "{{`{{.Release.Name}}`}}/values.yaml" {
-		t.Errorf("unexpected releases[2].missingFileHandler: expected={{`{{.Release.Name}}`}}/values.yaml, got=%s", st.Releases[1].Values[0])
+	if secondRelease.Values[0] != "{{`{{.Release.Name}}`}}/values.yaml" {
+		t.Errorf("unexpected releases[2].missingFileHandler: expected={{`{{.Release.Name}}`}}/values.yaml, got=%s", firstRelease.Values[0])
 	}
 
 	if st.HelmDefaults.KubeContext != "FOO" {
@@ -937,7 +1470,7 @@ releases:
 - name: myrelease0
   chart: mychart0
 `
-	testFs := state.NewTestFs(map[string]string{
+	testFs := testhelper.NewTestFs(map[string]string{
 		yamlFile: yamlContent,
 		"/path/to/base.yaml": `environments:
   default:
@@ -958,19 +1491,88 @@ foo: FOO
 `,
 	})
 	app := &App{
-		readFile:   testFs.ReadFile,
-		fileExists: testFs.FileExists,
-		glob:       testFs.Glob,
-		abs:        testFs.Abs,
-		Env:        "default",
-		Logger:     helmexec.NewLogger(os.Stderr, "debug"),
+		OverrideHelmBinary: DefaultHelmBinary,
+		readFile:           testFs.ReadFile,
+		fileExists:         testFs.FileExists,
+		glob:               testFs.Glob,
+		abs:                testFs.Abs,
+		Env:                "default",
+		Logger:             helmexec.NewLogger(os.Stderr, "debug"),
 	}
+
+	expectNoCallsToHelm(app)
+
 	st, err := app.loadDesiredStateFromYaml(yamlFile)
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
 
 	if st.HelmDefaults.TillerNamespace != "TILLER_NS" {
+		t.Errorf("unexpected helmDefaults.tillerNamespace: expected=TILLER_NS, got=%s", st.HelmDefaults.TillerNamespace)
+	}
+
+	if st.Releases[0].Name != "myrelease0" {
+		t.Errorf("unexpected releases[0].name: expected=myrelease0, got=%s", st.Releases[0].Name)
+	}
+
+	if st.HelmDefaults.KubeContext != "FOO" {
+		t.Errorf("unexpected helmDefaults.kubeContext: expected=FOO, got=%s", st.HelmDefaults.KubeContext)
+	}
+}
+
+func TestLoadDesiredStateFromYaml_InlineEnvVals(t *testing.T) {
+	yamlFile := "/path/to/yaml/file"
+	yamlContent := `bases:
+- ../base.yaml
+---
+bases:
+# "envvals inheritance"
+# base.gotmpl should be able to reference environment values defined in the base.yaml and default/1.yaml
+- ../base.gotmpl
+---
+releases:
+- name: myrelease0
+  chart: mychart0
+`
+	testFs := testhelper.NewTestFs(map[string]string{
+		yamlFile: yamlContent,
+		"/path/to/base.yaml": `environments:
+  default:
+    values:
+    - environments/default/1.yaml
+    - tillerNs: INLINE_TILLER_NS
+`,
+		"/path/to/base.gotmpl": `helmDefaults:
+  kubeContext: {{ .Environment.Values.foo }}
+  tillerNamespace: {{ .Environment.Values.tillerNs }}
+`,
+		"/path/to/yaml/environments/default/1.yaml": `tillerNs: TILLER_NS
+foo: FOO
+`,
+		"/path/to/yaml/templates.yaml": `templates:
+  default: &default
+    missingFileHandler: Warn
+    values: ["` + "{{`" + `{{.Release.Name}}` + "`}}" + `/values.yaml"]
+`,
+	})
+	app := &App{
+		OverrideHelmBinary: DefaultHelmBinary,
+		readFile:           testFs.ReadFile,
+		fileExists:         testFs.FileExists,
+		glob:               testFs.Glob,
+		abs:                testFs.Abs,
+		Env:                "default",
+		Logger:             helmexec.NewLogger(os.Stderr, "debug"),
+	}
+
+	expectNoCallsToHelm(app)
+
+	st, err := app.loadDesiredStateFromYaml(yamlFile)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+
+	if st.HelmDefaults.TillerNamespace != "INLINE_TILLER_NS" {
 		t.Errorf("unexpected helmDefaults.tillerNamespace: expected=TILLER_NS, got=%s", st.HelmDefaults.TillerNamespace)
 	}
 
@@ -1013,7 +1615,7 @@ releases:
     stage: post
   <<: *default
 `
-	testFs := state.NewTestFs(map[string]string{
+	testFs := testhelper.NewTestFs(map[string]string{
 		yamlFile: yamlContent,
 		"/path/to/base.yaml": `environments:
   test:
@@ -1037,13 +1639,17 @@ helmDefaults:
 `,
 	})
 	app := &App{
-		readFile:   testFs.ReadFile,
-		fileExists: testFs.FileExists,
-		glob:       testFs.Glob,
-		abs:        testFs.Abs,
-		Env:        "test",
-		Logger:     helmexec.NewLogger(os.Stderr, "debug"),
+		OverrideHelmBinary: DefaultHelmBinary,
+		readFile:           testFs.ReadFile,
+		fileExists:         testFs.FileExists,
+		glob:               testFs.Glob,
+		abs:                testFs.Abs,
+		Env:                "test",
+		Logger:             helmexec.NewLogger(os.Stderr, "debug"),
 	}
+
+	expectNoCallsToHelm(app)
+
 	st, err := app.loadDesiredStateFromYaml(yamlFile)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -1053,24 +1659,23 @@ helmDefaults:
 		t.Errorf("unexpected helmDefaults.tillerNamespace: expected=TILLER_NS, got=%s", st.HelmDefaults.TillerNamespace)
 	}
 
-	if st.Releases[0].Name != "myrelease0" {
-		t.Errorf("unexpected releases[0].name: expected=myrelease0, got=%s", st.Releases[0].Name)
+	firstRelease := st.Releases[0]
+	if firstRelease.Name != "myrelease1" {
+		t.Errorf("unexpected releases[1].name: expected=myrelease1, got=%s", firstRelease.Name)
 	}
-	if st.Releases[1].Name != "myrelease1" {
-		t.Errorf("unexpected releases[1].name: expected=myrelease1, got=%s", st.Releases[1].Name)
+	secondRelease := st.Releases[1]
+	if secondRelease.Name != "myrelease1" {
+		t.Errorf("unexpected releases[2].name: expected=myrelease1, got=%s", secondRelease.Name)
 	}
-	if st.Releases[2].Name != "myrelease1" {
-		t.Errorf("unexpected releases[2].name: expected=myrelease1, got=%s", st.Releases[2].Name)
+	if secondRelease.Values[0] != "{{`{{.Release.Name}}`}}/values.yaml" {
+		t.Errorf("unexpected releases[2].missingFileHandler: expected={{`{{.Release.Name}}`}}/values.yaml, got=%s", firstRelease.Values[0])
 	}
-	if st.Releases[2].Values[0] != "{{`{{.Release.Name}}`}}/values.yaml" {
-		t.Errorf("unexpected releases[2].missingFileHandler: expected={{`{{.Release.Name}}`}}/values.yaml, got=%s", st.Releases[1].Values[0])
-	}
-	if *st.Releases[2].MissingFileHandler != "Warn" {
-		t.Errorf("unexpected releases[2].missingFileHandler: expected=Warn, got=%s", *st.Releases[1].MissingFileHandler)
+	if *secondRelease.MissingFileHandler != "Warn" {
+		t.Errorf("unexpected releases[2].missingFileHandler: expected=Warn, got=%s", *firstRelease.MissingFileHandler)
 	}
 
-	if st.Releases[2].Values[0] != "{{`{{.Release.Name}}`}}/values.yaml" {
-		t.Errorf("unexpected releases[2].missingFileHandler: expected={{`{{.Release.Name}}`}}/values.yaml, got=%s", st.Releases[1].Values[0])
+	if secondRelease.Values[0] != "{{`{{.Release.Name}}`}}/values.yaml" {
+		t.Errorf("unexpected releases[2].missingFileHandler: expected={{`{{.Release.Name}}`}}/values.yaml, got=%s", firstRelease.Values[0])
 	}
 
 	if st.HelmDefaults.KubeContext != "FOO" {
@@ -1100,7 +1705,7 @@ releases:
   chart: mychart3
   <<: *default
 `
-	testFs := state.NewTestFs(map[string]string{
+	testFs := testhelper.NewTestFs(map[string]string{
 		yamlFile: yamlContent,
 		"/path/to/yaml/templates.yaml": `templates:
   default: &default
@@ -1109,14 +1714,17 @@ releases:
 `,
 	})
 	app := &App{
-		readFile: testFs.ReadFile,
-		glob:     testFs.Glob,
-		abs:      testFs.Abs,
-		Env:      "default",
-		Logger:   helmexec.NewLogger(os.Stderr, "debug"),
-		Reverse:  true,
+		OverrideHelmBinary: DefaultHelmBinary,
+		readFile:           testFs.ReadFile,
+		glob:               testFs.Glob,
+		abs:                testFs.Abs,
+		Env:                "default",
+		Logger:             helmexec.NewLogger(os.Stderr, "debug"),
 	}
-	st, err := app.loadDesiredStateFromYaml(yamlFile)
+
+	expectNoCallsToHelm(app)
+
+	st, err := app.loadDesiredStateFromYaml(yamlFile, LoadOpts{Reverse: true})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1127,10 +1735,2180 @@ releases:
 	if st.Releases[1].Name != "myrelease2" {
 		t.Errorf("unexpected releases[0].name: expected=myrelease2, got=%s", st.Releases[1].Name)
 	}
-	if st.Releases[2].Name != "myrelease1" {
-		t.Errorf("unexpected releases[0].name: expected=myrelease1, got=%s", st.Releases[2].Name)
+
+	if len(st.Releases) != 2 {
+		t.Errorf("unexpected number of releases: expected=2, got=%d", len(st.Releases))
 	}
-	if st.Releases[3].Name != "myrelease0" {
-		t.Errorf("unexpected releases[0].name: expected=myrelease0, got=%s", st.Releases[3].Name)
+}
+
+// See https://github.com/roboll/helmfile/issues/615
+func TestLoadDesiredStateFromYaml_MultiPartTemplate_NoMergeArrayInEnvVal(t *testing.T) {
+	statePath := "/path/to/helmfile.yaml"
+	stateContent := `
+environments:
+  default:
+    values:
+    - foo: ["foo"]
+---
+environments:
+  default:
+    values:
+    - foo: ["FOO"]
+    - 1.yaml
+---
+environments:
+  default:
+    values:
+    - 2.yaml
+---
+releases:
+- name: {{ .Environment.Values.foo | quote }}
+  chart: {{ .Environment.Values.bar | quote }}
+`
+	testFs := testhelper.NewTestFs(map[string]string{
+		statePath:         stateContent,
+		"/path/to/1.yaml": `bar: ["bar"]`,
+		"/path/to/2.yaml": `bar: ["BAR"]`,
+	})
+	app := &App{
+		OverrideHelmBinary: DefaultHelmBinary,
+		readFile:           testFs.ReadFile,
+		glob:               testFs.Glob,
+		abs:                testFs.Abs,
+		Env:                "default",
+		Logger:             helmexec.NewLogger(os.Stderr, "debug"),
 	}
+
+	expectNoCallsToHelm(app)
+
+	st, err := app.loadDesiredStateFromYaml(statePath, LoadOpts{Reverse: true})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if st.Releases[0].Name != "[FOO]" {
+		t.Errorf("unexpected releases[0].name: expected=FOO, got=%s", st.Releases[0].Name)
+	}
+	if st.Releases[0].Chart != "[BAR]" {
+		t.Errorf("unexpected releases[0].chart: expected=BAR, got=%s", st.Releases[0].Chart)
+	}
+}
+
+// See https://github.com/roboll/helmfile/issues/623
+func TestLoadDesiredStateFromYaml_MultiPartTemplate_MergeMapsVariousKeys(t *testing.T) {
+	type testcase struct {
+		overrideValues interface{}
+		expected       string
+	}
+	testcases := []testcase{
+		{map[interface{}]interface{}{"foo": "FOO"}, `FOO`},
+		{map[interface{}]interface{}{"foo": map[interface{}]interface{}{"foo": "FOO"}}, `map[foo:FOO]`},
+		{map[interface{}]interface{}{"foo": map[string]interface{}{"foo": "FOO"}}, `map[foo:FOO]`},
+		{map[interface{}]interface{}{"foo": []interface{}{"foo"}}, `[foo]`},
+		{map[interface{}]interface{}{"foo": "FOO"}, `FOO`},
+	}
+	for i := range testcases {
+		tc := testcases[i]
+		statePath := "/path/to/helmfile.yaml"
+		stateContent := `
+environments:
+  default:
+    values:
+    - 1.yaml
+    - 2.yaml
+---
+releases:
+- name: {{ .Environment.Values.foo | quote }}
+  chart: {{ .Environment.Values.bar | quote }}
+`
+		testFs := testhelper.NewTestFs(map[string]string{
+			statePath:         stateContent,
+			"/path/to/1.yaml": `bar: ["bar"]`,
+			"/path/to/2.yaml": `bar: ["BAR"]`,
+		})
+		app := &App{
+			OverrideHelmBinary: DefaultHelmBinary,
+			readFile:           testFs.ReadFile,
+			glob:               testFs.Glob,
+			abs:                testFs.Abs,
+			Env:                "default",
+			Logger:             helmexec.NewLogger(os.Stderr, "debug"),
+		}
+		opts := LoadOpts{
+			CalleePath: statePath,
+			Environment: state.SubhelmfileEnvironmentSpec{
+				OverrideValues: []interface{}{tc.overrideValues},
+			},
+			Reverse: true,
+		}
+
+		expectNoCallsToHelm(app)
+
+		st, err := app.loadDesiredStateFromYaml(statePath, opts)
+
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if st.Releases[0].Name != tc.expected {
+			t.Errorf("unexpected releases[0].name: expected=%s, got=%s", tc.expected, st.Releases[0].Name)
+		}
+		if st.Releases[0].Chart != "[BAR]" {
+			t.Errorf("unexpected releases[0].chart: expected=BAR, got=%s", st.Releases[0].Chart)
+		}
+	}
+}
+
+func TestLoadDesiredStateFromYaml_MultiPartTemplate_SprigDictFuncs(t *testing.T) {
+	type testcase struct {
+		state    string
+		expr     string
+		expected string
+	}
+	stateInline := `
+environments:
+  default:
+    values:
+    - foo: FOO
+      bar: { "baz": "BAZ" }
+---
+releases:
+- name: %s
+  chart: stable/nginx
+`
+	stateExternal := `
+environments:
+  default:
+    values:
+    - 1.yaml
+    - 2.yaml
+---
+releases:
+- name: %s
+  chart: stable/nginx
+`
+	testcases := []testcase{
+		{stateInline, `{{ getOrNil "foo" .Environment.Values }}`, `FOO`},
+		{stateInline, `{{ getOrNil "baz" (getOrNil "bar" .Environment.Values) }}`, `BAZ`},
+		{stateInline, `{{ if hasKey .Environment.Values "foo" }}{{ .Environment.Values.foo }}{{ end }}`, `FOO`},
+		{stateInline, `{{ if hasKey .Environment.Values "bar" }}{{ .Environment.Values.bar.baz }}{{ end }}`, `BAZ`},
+		{stateInline, `{{ if (keys .Environment.Values | has "foo") }}{{ .Environment.Values.foo }}{{ end }}`, `FOO`},
+		// See https://github.com/roboll/helmfile/issues/624
+		// This fails when .Environment.Values.bar is not map[string]interface{}. At the time of #624 it was map[interface{}]interface{}, which sprig's dict funcs don't support.
+		{stateInline, `{{ if (keys .Environment.Values | has "bar") }}{{ if (keys .Environment.Values.bar | has "baz") }}{{ .Environment.Values.bar.baz }}{{ end }}{{ end }}`, `BAZ`},
+		{stateExternal, `{{ getOrNil "foo" .Environment.Values }}`, `FOO`},
+		{stateExternal, `{{ getOrNil "baz" (getOrNil "bar" .Environment.Values) }}`, `BAZ`},
+		{stateExternal, `{{ if hasKey .Environment.Values "foo" }}{{ .Environment.Values.foo }}{{ end }}`, `FOO`},
+		{stateExternal, `{{ if hasKey .Environment.Values "bar" }}{{ .Environment.Values.bar.baz }}{{ end }}`, `BAZ`},
+		{stateExternal, `{{ if (keys .Environment.Values | has "foo") }}{{ .Environment.Values.foo }}{{ end }}`, `FOO`},
+		// See https://github.com/roboll/helmfile/issues/624
+		{stateExternal, `{{ if (keys .Environment.Values | has "bar") }}{{ if (keys .Environment.Values.bar | has "baz") }}{{ .Environment.Values.bar.baz }}{{ end }}{{ end }}`, `BAZ`},
+		// See https://github.com/roboll/helmfile/issues/643
+		{stateExternal, `{{ range $service := .Environment.Values.services }}{{ $service.name }}{{ if hasKey $service "something" }}{{ $service.something }}{{ end }}{{ end }}`, `xyfalse`},
+		// Same test with .Values
+		{stateInline, `{{ getOrNil "foo" .Values }}`, `FOO`},
+		{stateInline, `{{ getOrNil "baz" (getOrNil "bar" .Values) }}`, `BAZ`},
+		{stateInline, `{{ if hasKey .Values "foo" }}{{ .Values.foo }}{{ end }}`, `FOO`},
+		{stateInline, `{{ if hasKey .Values "bar" }}{{ .Values.bar.baz }}{{ end }}`, `BAZ`},
+		{stateInline, `{{ if (keys .Values | has "foo") }}{{ .Values.foo }}{{ end }}`, `FOO`},
+		// See https://github.com/roboll/helmfile/issues/624
+		// This fails when .Values.bar is not map[string]interface{}. At the time of #624 it was map[interface{}]interface{}, which sprig's dict funcs don't support.
+		{stateInline, `{{ if (keys .Values | has "bar") }}{{ if (keys .Values.bar | has "baz") }}{{ .Values.bar.baz }}{{ end }}{{ end }}`, `BAZ`},
+		{stateExternal, `{{ getOrNil "foo" .Values }}`, `FOO`},
+		{stateExternal, `{{ getOrNil "baz" (getOrNil "bar" .Values) }}`, `BAZ`},
+		{stateExternal, `{{ if hasKey .Values "foo" }}{{ .Values.foo }}{{ end }}`, `FOO`},
+		{stateExternal, `{{ if hasKey .Values "bar" }}{{ .Values.bar.baz }}{{ end }}`, `BAZ`},
+		{stateExternal, `{{ if (keys .Values | has "foo") }}{{ .Values.foo }}{{ end }}`, `FOO`},
+		// See https://github.com/roboll/helmfile/issues/624
+		{stateExternal, `{{ if (keys .Values | has "bar") }}{{ if (keys .Values.bar | has "baz") }}{{ .Values.bar.baz }}{{ end }}{{ end }}`, `BAZ`},
+		// See https://github.com/roboll/helmfile/issues/643
+		{stateExternal, `{{ range $service := .Values.services }}{{ $service.name }}{{ if hasKey $service "something" }}{{ $service.something }}{{ end }}{{ end }}`, `xyfalse`},
+	}
+	for i := range testcases {
+		tc := testcases[i]
+		statePath := "/path/to/helmfile.yaml"
+		stateContent := fmt.Sprintf(tc.state, tc.expr)
+		testFs := testhelper.NewTestFs(map[string]string{
+			statePath:         stateContent,
+			"/path/to/1.yaml": `foo: FOO`,
+			"/path/to/2.yaml": `bar: { "baz": "BAZ" }
+services:
+  - name: "x"
+  - name: "y"
+    something: false
+`,
+		})
+		app := &App{
+			OverrideHelmBinary: DefaultHelmBinary,
+			readFile:           testFs.ReadFile,
+			glob:               testFs.Glob,
+			abs:                testFs.Abs,
+			Env:                "default",
+			Logger:             helmexec.NewLogger(os.Stderr, "debug"),
+		}
+
+		expectNoCallsToHelm(app)
+
+		st, err := app.loadDesiredStateFromYaml(statePath, LoadOpts{Reverse: true})
+
+		if err != nil {
+			t.Fatalf("unexpected error at %d: %v", i, err)
+		}
+
+		if st.Releases[0].Name != tc.expected {
+			t.Errorf("unexpected releases[0].name at %d: expected=%s, got=%s", i, tc.expected, st.Releases[0].Name)
+		}
+	}
+}
+
+type configImpl struct {
+	set []string
+}
+
+func (c configImpl) Set() []string {
+	return c.set
+}
+
+func (c configImpl) Values() []string {
+	return []string{}
+}
+
+func (c configImpl) Args() string {
+	return "some args"
+}
+
+func (c configImpl) Validate() bool {
+	return true
+}
+
+func (c configImpl) SkipDeps() bool {
+	return true
+}
+
+func (c configImpl) OutputDir() string {
+	return "output/subdir"
+}
+
+func (c configImpl) Concurrency() int {
+	return 1
+}
+
+type applyConfig struct {
+	args              string
+	values            []string
+	retainValuesFiles bool
+	set               []string
+	validate          bool
+	skipDeps          bool
+	includeTests      bool
+	suppressSecrets   bool
+	suppressDiff      bool
+	noColor           bool
+	context           int
+	concurrency       int
+	detailedExitcode  bool
+	interactive       bool
+	logger            *zap.SugaredLogger
+}
+
+func (a applyConfig) Args() string {
+	return a.args
+}
+
+func (a applyConfig) Values() []string {
+	return a.values
+}
+
+func (a applyConfig) Set() []string {
+	return a.set
+}
+
+func (a applyConfig) Validate() bool {
+	return a.validate
+}
+
+func (a applyConfig) SkipDeps() bool {
+	return a.skipDeps
+}
+
+func (a applyConfig) IncludeTests() bool {
+	return a.includeTests
+}
+
+func (a applyConfig) SuppressSecrets() bool {
+	return a.suppressSecrets
+}
+
+func (a applyConfig) SuppressDiff() bool {
+	return a.suppressDiff
+}
+
+func (a applyConfig) NoColor() bool {
+	return a.noColor
+}
+
+func (a applyConfig) Context() int {
+	return a.context
+}
+
+func (a applyConfig) Concurrency() int {
+	return a.concurrency
+}
+
+func (a applyConfig) DetailedExitcode() bool {
+	return a.detailedExitcode
+}
+
+func (a applyConfig) Interactive() bool {
+	return a.interactive
+}
+
+func (a applyConfig) Logger() *zap.SugaredLogger {
+	return a.logger
+}
+
+func (a applyConfig) RetainValuesFiles() bool {
+	return a.retainValuesFiles
+}
+
+// Mocking the command-line runner
+
+type mockRunner struct {
+	output []byte
+	err    error
+}
+
+func (mock *mockRunner) Execute(cmd string, args []string, env map[string]string) ([]byte, error) {
+	return []byte{}, nil
+}
+
+func MockExecer(logger *zap.SugaredLogger, kubeContext string) helmexec.Interface {
+	execer := helmexec.New("helm", logger, kubeContext, &mockRunner{})
+	return execer
+}
+
+// mocking helmexec.Interface
+
+type listKey struct {
+	filter string
+	flags  string
+}
+
+type mockHelmExec struct {
+	templated []mockTemplates
+
+	updateDepsCallbacks map[string]func(string) error
+}
+
+type mockTemplates struct {
+	name, chart string
+	flags       []string
+}
+
+func (helm *mockHelmExec) TemplateRelease(name, chart string, flags ...string) error {
+	helm.templated = append(helm.templated, mockTemplates{name: name, chart: chart, flags: flags})
+	return nil
+}
+
+func (helm *mockHelmExec) UpdateDeps(chart string) error {
+	return nil
+}
+
+func (helm *mockHelmExec) BuildDeps(name, chart string) error {
+	return nil
+}
+
+func (helm *mockHelmExec) SetExtraArgs(args ...string) {
+	return
+}
+func (helm *mockHelmExec) SetHelmBinary(bin string) {
+	return
+}
+func (helm *mockHelmExec) AddRepo(name, repository, cafile, certfile, keyfile, username, password string) error {
+	return nil
+}
+func (helm *mockHelmExec) UpdateRepo() error {
+	return nil
+}
+func (helm *mockHelmExec) SyncRelease(context helmexec.HelmContext, name, chart string, flags ...string) error {
+	return nil
+}
+func (helm *mockHelmExec) DiffRelease(context helmexec.HelmContext, name, chart string, suppressDiff bool, flags ...string) error {
+	return nil
+}
+func (helm *mockHelmExec) ReleaseStatus(context helmexec.HelmContext, release string, flags ...string) error {
+	return nil
+}
+func (helm *mockHelmExec) DeleteRelease(context helmexec.HelmContext, name string, flags ...string) error {
+	return nil
+}
+
+func (helm *mockHelmExec) List(context helmexec.HelmContext, filter string, flags ...string) (string, error) {
+	return "", nil
+}
+
+func (helm *mockHelmExec) DecryptSecret(context helmexec.HelmContext, name string, flags ...string) (string, error) {
+	return "", nil
+}
+func (helm *mockHelmExec) TestRelease(context helmexec.HelmContext, name string, flags ...string) error {
+	return nil
+}
+func (helm *mockHelmExec) Fetch(chart string, flags ...string) error {
+	return nil
+}
+func (helm *mockHelmExec) Lint(name, chart string, flags ...string) error {
+	return nil
+}
+func (helm *mockHelmExec) IsHelm3() bool {
+	return false
+}
+
+func TestTemplate_SingleStateFile(t *testing.T) {
+	files := map[string]string{
+		"/path/to/helmfile.yaml": `
+releases:
+- name: myrelease1
+  chart: mychart1
+- name: myrelease2
+  chart: mychart2
+`,
+	}
+
+	var helm = &mockHelmExec{}
+	var wantReleases = []mockTemplates{
+		{name: "myrelease1", chart: "mychart1", flags: []string{"--namespace", "testNamespace", "--set", "foo=a", "--set", "bar=b", "--output-dir", "output/subdir/helmfile-[a-z0-9]{8}-myrelease1"}},
+		{name: "myrelease2", chart: "mychart2", flags: []string{"--namespace", "testNamespace", "--set", "foo=a", "--set", "bar=b", "--output-dir", "output/subdir/helmfile-[a-z0-9]{8}-myrelease2"}},
+	}
+
+	var buffer bytes.Buffer
+	logger := helmexec.NewLogger(&buffer, "debug")
+
+	valsRuntime, err := vals.New(vals.Options{CacheSize: 32})
+	if err != nil {
+		t.Errorf("unexpected error creating vals runtime: %v", err)
+	}
+
+	app := appWithFs(&App{
+		OverrideHelmBinary:  DefaultHelmBinary,
+		glob:                filepath.Glob,
+		abs:                 filepath.Abs,
+		OverrideKubeContext: "default",
+		Env:                 "default",
+		Logger:              logger,
+		helms: map[helmKey]helmexec.Interface{
+			createHelmKey("helm", "default"): helm,
+		},
+		Namespace:   "testNamespace",
+		valsRuntime: valsRuntime,
+	}, files)
+
+	app.Template(configImpl{set: []string{"foo=a", "bar=b"}})
+
+	for i := range wantReleases {
+		if wantReleases[i].name != helm.templated[i].name {
+			t.Errorf("name = [%v], want %v", helm.templated[i].name, wantReleases[i].name)
+		}
+		if !strings.Contains(helm.templated[i].chart, wantReleases[i].chart) {
+			t.Errorf("chart = [%v], want %v", helm.templated[i].chart, wantReleases[i].chart)
+		}
+		for j := range wantReleases[i].flags {
+			if j == 7 {
+				matched, _ := regexp.Match(wantReleases[i].flags[j], []byte(helm.templated[i].flags[j]))
+				if !matched {
+					t.Errorf("HelmState.TemplateReleases() = [%v], want %v", helm.templated[i].flags[j], wantReleases[i].flags[j])
+				}
+			} else if wantReleases[i].flags[j] != helm.templated[i].flags[j] {
+				t.Errorf("HelmState.TemplateReleases() = [%v], want %v", helm.templated[i].flags[j], wantReleases[i].flags[j])
+			}
+		}
+
+	}
+}
+
+func TestTemplate_ApiVersions(t *testing.T) {
+	files := map[string]string{
+		"/path/to/helmfile.yaml": `
+apiVersions:
+- helmfile.test/v1
+- helmfile.test/v2
+releases:
+- name: myrelease1
+  chart: mychart1
+`,
+	}
+
+	var helm = &mockHelmExec{}
+	var wantReleases = []mockTemplates{
+		{name: "myrelease1", chart: "mychart1", flags: []string{"--api-versions", "helmfile.test/v1", "--api-versions", "helmfile.test/v2", "--namespace", "testNamespace", "--output-dir", "output/subdir/helmfile-[a-z0-9]{8}-myrelease1"}},
+	}
+
+	var buffer bytes.Buffer
+	logger := helmexec.NewLogger(&buffer, "debug")
+
+	valsRuntime, err := vals.New(vals.Options{CacheSize: 32})
+	if err != nil {
+		t.Errorf("unexpected error creating vals runtime: %v", err)
+	}
+
+	app := appWithFs(&App{
+		OverrideHelmBinary:  DefaultHelmBinary,
+		glob:                filepath.Glob,
+		abs:                 filepath.Abs,
+		OverrideKubeContext: "default",
+		Env:                 "default",
+		Logger:              logger,
+		helms: map[helmKey]helmexec.Interface{
+			createHelmKey("helm", "default"): helm,
+		},
+		Namespace:   "testNamespace",
+		valsRuntime: valsRuntime,
+	}, files)
+
+	app.Template(configImpl{})
+
+	for i := range wantReleases {
+		if wantReleases[i].name != helm.templated[i].name {
+			t.Errorf("name = [%v], want %v", helm.templated[i].name, wantReleases[i].name)
+		}
+		if !strings.Contains(helm.templated[i].chart, wantReleases[i].chart) {
+			t.Errorf("chart = [%v], want %v", helm.templated[i].chart, wantReleases[i].chart)
+		}
+		for j := range wantReleases[i].flags {
+			if j == 7 {
+				matched, _ := regexp.Match(wantReleases[i].flags[j], []byte(helm.templated[i].flags[j]))
+				if !matched {
+					t.Errorf("HelmState.TemplateReleases() = [%v], want %v", helm.templated[i].flags[j], wantReleases[i].flags[j])
+				}
+			} else if wantReleases[i].flags[j] != helm.templated[i].flags[j] {
+				t.Errorf("HelmState.TemplateReleases() = [%v], want %v", helm.templated[i].flags[j], wantReleases[i].flags[j])
+			}
+		}
+
+	}
+}
+
+func TestApply(t *testing.T) {
+	testcases := []struct {
+		name        string
+		loc         string
+		ns          string
+		concurrency int
+		error       string
+		files       map[string]string
+		selectors   []string
+		lists       map[exectest.ListKey]string
+		diffs       map[exectest.DiffKey]error
+		upgraded    []exectest.Release
+		deleted     []exectest.Release
+		log         string
+	}{
+		//
+		// complex test cases for smoke testing
+		//
+		{
+			name: "smoke",
+			loc:  location(),
+			files: map[string]string{
+				"/path/to/helmfile.yaml": `
+releases:
+- name: database
+  chart: charts/mysql
+  needs:
+  - logging
+- name: frontend-v1
+  chart: charts/frontend
+  installed: false
+  needs:
+  - servicemesh
+  - logging
+  - backend-v1
+- name: frontend-v2
+  chart: charts/frontend
+  needs:
+  - servicemesh
+  - logging
+  - backend-v2
+- name: frontend-v3
+  chart: charts/frontend
+  needs:
+  - servicemesh
+  - logging
+  - backend-v2
+- name: backend-v1
+  chart: charts/backend
+  installed: false
+  needs:
+  - servicemesh
+  - logging
+  - database
+  - anotherbackend
+- name: backend-v2
+  chart: charts/backend
+  needs:
+  - servicemesh
+  - logging
+  - database
+  - anotherbackend
+- name: anotherbackend
+  chart: charts/anotherbackend
+  needs:
+  - servicemesh
+  - logging
+  - database
+- name: servicemesh
+  chart: charts/istio
+  needs:
+  - logging
+- name: logging
+  chart: charts/fluent-bit
+- name: front-proxy
+  chart: stable/envoy
+`,
+			},
+			diffs: map[exectest.DiffKey]error{
+				// noop on frontend-v2
+				exectest.DiffKey{Name: "frontend-v2", Chart: "charts/frontend", Flags: "--kube-contextdefault--detailed-exitcode"}: nil,
+				// install frontend-v3
+				exectest.DiffKey{Name: "frontend-v3", Chart: "charts/frontend", Flags: "--kube-contextdefault--detailed-exitcode"}: helmexec.ExitError{Code: 2},
+				// upgrades
+				exectest.DiffKey{Name: "logging", Chart: "charts/fluent-bit", Flags: "--kube-contextdefault--detailed-exitcode"}:            helmexec.ExitError{Code: 2},
+				exectest.DiffKey{Name: "front-proxy", Chart: "stable/envoy", Flags: "--kube-contextdefault--detailed-exitcode"}:             helmexec.ExitError{Code: 2},
+				exectest.DiffKey{Name: "servicemesh", Chart: "charts/istio", Flags: "--kube-contextdefault--detailed-exitcode"}:             helmexec.ExitError{Code: 2},
+				exectest.DiffKey{Name: "database", Chart: "charts/mysql", Flags: "--kube-contextdefault--detailed-exitcode"}:                helmexec.ExitError{Code: 2},
+				exectest.DiffKey{Name: "backend-v2", Chart: "charts/backend", Flags: "--kube-contextdefault--detailed-exitcode"}:            helmexec.ExitError{Code: 2},
+				exectest.DiffKey{Name: "anotherbackend", Chart: "charts/anotherbackend", Flags: "--kube-contextdefault--detailed-exitcode"}: helmexec.ExitError{Code: 2},
+			},
+			lists: map[exectest.ListKey]string{
+				// delete frontend-v1 and backend-v1
+				exectest.ListKey{Filter: "^frontend-v1$", Flags: "--kube-contextdefault--deployed--failed--pending"}: `NAME	REVISION	UPDATED                 	STATUS  	CHART        	APP VERSION	NAMESPACE
+frontend-v1 	4       	Fri Nov  1 08:40:07 2019	DEPLOYED	backend-3.1.0	3.1.0      	default
+`,
+				exectest.ListKey{Filter: "^backend-v1$", Flags: "--kube-contextdefault--deployed--failed--pending"}: `NAME	REVISION	UPDATED                 	STATUS  	CHART        	APP VERSION	NAMESPACE
+backend-v1 	4       	Fri Nov  1 08:40:07 2019	DEPLOYED	backend-3.1.0	3.1.0      	default
+`,
+			},
+			// Disable concurrency to avoid in-deterministic result
+			concurrency: 1,
+			upgraded: []exectest.Release{
+				{Name: "logging", Flags: []string{}},
+				{Name: "front-proxy", Flags: []string{}},
+				{Name: "database", Flags: []string{}},
+				{Name: "servicemesh", Flags: []string{}},
+				{Name: "anotherbackend", Flags: []string{}},
+				{Name: "backend-v2", Flags: []string{}},
+				{Name: "frontend-v3", Flags: []string{}},
+			},
+			deleted: []exectest.Release{
+				{Name: "frontend-v1", Flags: []string{}},
+			},
+			log: `processing file "helmfile.yaml" in directory "."
+first-pass rendering starting for "helmfile.yaml.part.0": inherited=&{default map[] map[]}, overrode=<nil>
+first-pass uses: &{default map[] map[]}
+first-pass rendering output of "helmfile.yaml.part.0":
+ 0: 
+ 1: releases:
+ 2: - name: database
+ 3:   chart: charts/mysql
+ 4:   needs:
+ 5:   - logging
+ 6: - name: frontend-v1
+ 7:   chart: charts/frontend
+ 8:   installed: false
+ 9:   needs:
+10:   - servicemesh
+11:   - logging
+12:   - backend-v1
+13: - name: frontend-v2
+14:   chart: charts/frontend
+15:   needs:
+16:   - servicemesh
+17:   - logging
+18:   - backend-v2
+19: - name: frontend-v3
+20:   chart: charts/frontend
+21:   needs:
+22:   - servicemesh
+23:   - logging
+24:   - backend-v2
+25: - name: backend-v1
+26:   chart: charts/backend
+27:   installed: false
+28:   needs:
+29:   - servicemesh
+30:   - logging
+31:   - database
+32:   - anotherbackend
+33: - name: backend-v2
+34:   chart: charts/backend
+35:   needs:
+36:   - servicemesh
+37:   - logging
+38:   - database
+39:   - anotherbackend
+40: - name: anotherbackend
+41:   chart: charts/anotherbackend
+42:   needs:
+43:   - servicemesh
+44:   - logging
+45:   - database
+46: - name: servicemesh
+47:   chart: charts/istio
+48:   needs:
+49:   - logging
+50: - name: logging
+51:   chart: charts/fluent-bit
+52: - name: front-proxy
+53:   chart: stable/envoy
+54: 
+
+first-pass produced: &{default map[] map[]}
+first-pass rendering result of "helmfile.yaml.part.0": {default map[] map[]}
+vals:
+map[]
+defaultVals:[]
+second-pass rendering result of "helmfile.yaml.part.0":
+ 0: 
+ 1: releases:
+ 2: - name: database
+ 3:   chart: charts/mysql
+ 4:   needs:
+ 5:   - logging
+ 6: - name: frontend-v1
+ 7:   chart: charts/frontend
+ 8:   installed: false
+ 9:   needs:
+10:   - servicemesh
+11:   - logging
+12:   - backend-v1
+13: - name: frontend-v2
+14:   chart: charts/frontend
+15:   needs:
+16:   - servicemesh
+17:   - logging
+18:   - backend-v2
+19: - name: frontend-v3
+20:   chart: charts/frontend
+21:   needs:
+22:   - servicemesh
+23:   - logging
+24:   - backend-v2
+25: - name: backend-v1
+26:   chart: charts/backend
+27:   installed: false
+28:   needs:
+29:   - servicemesh
+30:   - logging
+31:   - database
+32:   - anotherbackend
+33: - name: backend-v2
+34:   chart: charts/backend
+35:   needs:
+36:   - servicemesh
+37:   - logging
+38:   - database
+39:   - anotherbackend
+40: - name: anotherbackend
+41:   chart: charts/anotherbackend
+42:   needs:
+43:   - servicemesh
+44:   - logging
+45:   - database
+46: - name: servicemesh
+47:   chart: charts/istio
+48:   needs:
+49:   - logging
+50: - name: logging
+51:   chart: charts/fluent-bit
+52: - name: front-proxy
+53:   chart: stable/envoy
+54: 
+
+merged environment: &{default map[] map[]}
+10 release(s) found in helmfile.yaml
+
+worker 1/1 started
+worker 1/1 finished
+worker 1/1 started
+worker 1/1 finished
+Affected releases are:
+  anotherbackend (charts/anotherbackend) UPDATED
+  backend-v1 (charts/backend) DELETED
+  backend-v2 (charts/backend) UPDATED
+  database (charts/mysql) UPDATED
+  front-proxy (stable/envoy) UPDATED
+  frontend-v1 (charts/frontend) DELETED
+  frontend-v3 (charts/frontend) UPDATED
+  logging (charts/fluent-bit) UPDATED
+  servicemesh (charts/istio) UPDATED
+
+processing 5 groups of releases in this order:
+GROUP RELEASES
+1     frontend-v1, frontend-v2, frontend-v3
+2     backend-v1, backend-v2
+3     anotherbackend
+4     database, servicemesh
+5     logging, front-proxy
+
+processing releases in group 1/5: frontend-v1, frontend-v2, frontend-v3
+worker 1/1 started
+worker 1/1 finished
+processing releases in group 2/5: backend-v1, backend-v2
+worker 1/1 started
+worker 1/1 finished
+processing releases in group 3/5: anotherbackend
+processing releases in group 4/5: database, servicemesh
+processing releases in group 5/5: logging, front-proxy
+processing 5 groups of releases in this order:
+GROUP RELEASES
+1     logging, front-proxy
+2     database, servicemesh
+3     anotherbackend
+4     backend-v1, backend-v2
+5     frontend-v1, frontend-v2, frontend-v3
+
+processing releases in group 1/5: logging, front-proxy
+worker 1/1 started
+worker 1/1 finished
+worker 1/1 started
+getting deployed release version failed:unexpected list key: {^logging$ --kube-contextdefault--deployed--failed--pending}
+getting deployed release version failed:unexpected list key: {^front-proxy$ --kube-contextdefault--deployed--failed--pending}
+worker 1/1 finished
+processing releases in group 2/5: database, servicemesh
+worker 1/1 started
+worker 1/1 finished
+worker 1/1 started
+getting deployed release version failed:unexpected list key: {^database$ --kube-contextdefault--deployed--failed--pending}
+getting deployed release version failed:unexpected list key: {^servicemesh$ --kube-contextdefault--deployed--failed--pending}
+worker 1/1 finished
+processing releases in group 3/5: anotherbackend
+worker 1/1 started
+worker 1/1 finished
+worker 1/1 started
+getting deployed release version failed:unexpected list key: {^anotherbackend$ --kube-contextdefault--deployed--failed--pending}
+worker 1/1 finished
+processing releases in group 4/5: backend-v1, backend-v2
+worker 1/1 started
+worker 1/1 finished
+worker 1/1 started
+getting deployed release version failed:unexpected list key: {^backend-v2$ --kube-contextdefault--deployed--failed--pending}
+worker 1/1 finished
+processing releases in group 5/5: frontend-v1, frontend-v2, frontend-v3
+worker 1/1 started
+worker 1/1 finished
+worker 1/1 started
+getting deployed release version failed:unexpected list key: {^frontend-v3$ --kube-contextdefault--deployed--failed--pending}
+worker 1/1 finished
+
+UPDATED RELEASES:
+NAME             CHART                   VERSION
+logging          charts/fluent-bit              
+front-proxy      stable/envoy                   
+database         charts/mysql                   
+servicemesh      charts/istio                   
+anotherbackend   charts/anotherbackend          
+backend-v2       charts/backend                 
+frontend-v3      charts/frontend                
+
+
+DELETED RELEASES:
+NAME
+frontend-v1
+backend-v1
+`,
+		},
+		//
+		// noop: no changes
+		//
+		{
+			name: "noop",
+			loc:  location(),
+			files: map[string]string{
+				"/path/to/helmfile.yaml": `
+releases:
+- name: bar
+  chart: mychart2
+- name: foo
+  chart: mychart1
+  installed: false
+  needs:
+  - bar
+`,
+			},
+			diffs: map[exectest.DiffKey]error{
+				exectest.DiffKey{Name: "bar", Chart: "mychart2", Flags: "--kube-contextdefault--detailed-exitcode"}: nil,
+			},
+			lists: map[exectest.ListKey]string{
+				exectest.ListKey{Filter: "^foo$", Flags: "--kube-contextdefault--deployed--failed--pending"}: ``,
+				exectest.ListKey{Filter: "^bar$", Flags: "--kube-contextdefault--deployed--failed--pending"}: `NAME	REVISION	UPDATED                 	STATUS  	CHART        	APP VERSION	NAMESPACE
+bar 	4       	Fri Nov  1 08:40:07 2019	DEPLOYED	mychart2-3.1.0	3.1.0      	default
+`,
+			},
+			upgraded: []exectest.Release{},
+			deleted:  []exectest.Release{},
+		},
+		//
+		// install
+		//
+		{
+			name: "install",
+			loc:  location(),
+			files: map[string]string{
+				"/path/to/helmfile.yaml": `
+releases:
+- name: baz
+  chart: mychart3
+- name: foo
+  chart: mychart1
+  needs:
+  - bar
+- name: bar
+  chart: mychart2
+`,
+			},
+			diffs: map[exectest.DiffKey]error{
+				exectest.DiffKey{Name: "foo", Chart: "mychart1", Flags: "--kube-contextdefault--detailed-exitcode"}: helmexec.ExitError{Code: 2},
+				exectest.DiffKey{Name: "bar", Chart: "mychart2", Flags: "--kube-contextdefault--detailed-exitcode"}: helmexec.ExitError{Code: 2},
+				exectest.DiffKey{Name: "baz", Chart: "mychart3", Flags: "--kube-contextdefault--detailed-exitcode"}: helmexec.ExitError{Code: 2},
+			},
+			lists: map[exectest.ListKey]string{},
+			upgraded: []exectest.Release{
+				{Name: "baz", Flags: []string{}},
+				{Name: "bar", Flags: []string{}},
+				{Name: "foo", Flags: []string{}},
+			},
+			deleted:     []exectest.Release{},
+			concurrency: 1,
+			log: `processing file "helmfile.yaml" in directory "."
+first-pass rendering starting for "helmfile.yaml.part.0": inherited=&{default map[] map[]}, overrode=<nil>
+first-pass uses: &{default map[] map[]}
+first-pass rendering output of "helmfile.yaml.part.0":
+ 0: 
+ 1: releases:
+ 2: - name: baz
+ 3:   chart: mychart3
+ 4: - name: foo
+ 5:   chart: mychart1
+ 6:   needs:
+ 7:   - bar
+ 8: - name: bar
+ 9:   chart: mychart2
+10: 
+
+first-pass produced: &{default map[] map[]}
+first-pass rendering result of "helmfile.yaml.part.0": {default map[] map[]}
+vals:
+map[]
+defaultVals:[]
+second-pass rendering result of "helmfile.yaml.part.0":
+ 0: 
+ 1: releases:
+ 2: - name: baz
+ 3:   chart: mychart3
+ 4: - name: foo
+ 5:   chart: mychart1
+ 6:   needs:
+ 7:   - bar
+ 8: - name: bar
+ 9:   chart: mychart2
+10: 
+
+merged environment: &{default map[] map[]}
+3 release(s) found in helmfile.yaml
+
+worker 1/1 started
+worker 1/1 finished
+worker 1/1 started
+worker 1/1 finished
+Affected releases are:
+  bar (mychart2) UPDATED
+  baz (mychart3) UPDATED
+  foo (mychart1) UPDATED
+
+processing 2 groups of releases in this order:
+GROUP RELEASES
+1     baz, bar
+2     foo
+
+processing releases in group 1/2: baz, bar
+worker 1/1 started
+worker 1/1 finished
+worker 1/1 started
+getting deployed release version failed:unexpected list key: {^baz$ --kube-contextdefault--deployed--failed--pending}
+getting deployed release version failed:unexpected list key: {^bar$ --kube-contextdefault--deployed--failed--pending}
+worker 1/1 finished
+processing releases in group 2/2: foo
+worker 1/1 started
+worker 1/1 finished
+worker 1/1 started
+getting deployed release version failed:unexpected list key: {^foo$ --kube-contextdefault--deployed--failed--pending}
+worker 1/1 finished
+
+UPDATED RELEASES:
+NAME   CHART      VERSION
+baz    mychart3          
+bar    mychart2          
+foo    mychart1          
+
+`,
+		},
+		//
+		// upgrades
+		//
+		{
+			name: "upgrade when foo needs bar",
+			loc:  location(),
+			files: map[string]string{
+				"/path/to/helmfile.yaml": `
+releases:
+- name: bar
+  chart: mychart2
+- name: foo
+  chart: mychart1
+  needs:
+  - bar
+`,
+			},
+			diffs: map[exectest.DiffKey]error{
+				exectest.DiffKey{Name: "bar", Chart: "mychart2", Flags: "--kube-contextdefault--detailed-exitcode"}: helmexec.ExitError{Code: 2},
+				exectest.DiffKey{Name: "foo", Chart: "mychart1", Flags: "--kube-contextdefault--detailed-exitcode"}: helmexec.ExitError{Code: 2},
+			},
+			upgraded: []exectest.Release{
+				{Name: "bar", Flags: []string{}},
+				{Name: "foo", Flags: []string{}},
+			},
+		},
+		{
+			name: "upgrade when bar needs foo",
+			loc:  location(),
+			files: map[string]string{
+				"/path/to/helmfile.yaml": `
+releases:
+- name: foo
+  chart: mychart1
+- name: bar
+  chart: mychart2
+  needs:
+  - foo
+`,
+			},
+			diffs: map[exectest.DiffKey]error{
+				exectest.DiffKey{Name: "bar", Chart: "mychart2", Flags: "--kube-contextdefault--detailed-exitcode"}: helmexec.ExitError{Code: 2},
+				exectest.DiffKey{Name: "foo", Chart: "mychart1", Flags: "--kube-contextdefault--detailed-exitcode"}: helmexec.ExitError{Code: 2},
+			},
+			upgraded: []exectest.Release{
+				{Name: "foo", Flags: []string{}},
+				{Name: "bar", Flags: []string{}},
+			},
+		},
+		{
+			name: "upgrade when foo needs bar, with ns override",
+			loc:  location(),
+			ns:   "testNamespace",
+			files: map[string]string{
+				"/path/to/helmfile.yaml": `
+releases:
+- name: bar
+  chart: mychart2
+- name: foo
+  chart: mychart1
+  needs:
+  - bar
+`,
+			},
+			diffs: map[exectest.DiffKey]error{
+				exectest.DiffKey{Name: "bar", Chart: "mychart2", Flags: "--kube-contextdefault--namespacetestNamespace--detailed-exitcode"}: helmexec.ExitError{Code: 2},
+				exectest.DiffKey{Name: "foo", Chart: "mychart1", Flags: "--kube-contextdefault--namespacetestNamespace--detailed-exitcode"}: helmexec.ExitError{Code: 2},
+			},
+			upgraded: []exectest.Release{
+				{Name: "bar", Flags: []string{}},
+				{Name: "foo", Flags: []string{}},
+			},
+		},
+		{
+			name: "upgrade when bar needs foo, with ns override",
+			loc:  location(),
+			ns:   "testNamespace",
+			files: map[string]string{
+				"/path/to/helmfile.yaml": `
+releases:
+- name: foo
+  chart: mychart1
+- name: bar
+  chart: mychart2
+  needs:
+  - foo
+`,
+			},
+			diffs: map[exectest.DiffKey]error{
+				exectest.DiffKey{Name: "bar", Chart: "mychart2", Flags: "--kube-contextdefault--namespacetestNamespace--detailed-exitcode"}: helmexec.ExitError{Code: 2},
+				exectest.DiffKey{Name: "foo", Chart: "mychart1", Flags: "--kube-contextdefault--namespacetestNamespace--detailed-exitcode"}: helmexec.ExitError{Code: 2},
+			},
+			upgraded: []exectest.Release{
+				{Name: "foo", Flags: []string{}},
+				{Name: "bar", Flags: []string{}},
+			},
+		},
+		{
+			name: "upgrade when ns1/foo needs ns2/bar",
+			loc:  location(),
+			files: map[string]string{
+				"/path/to/helmfile.yaml": `
+releases:
+- name: foo
+  chart: mychart1
+  namespace: ns1
+  needs:
+  - ns2/bar
+- name: bar
+  chart: mychart2
+  namespace: ns2
+`,
+			},
+			diffs: map[exectest.DiffKey]error{
+				exectest.DiffKey{Name: "bar", Chart: "mychart2", Flags: "--kube-contextdefault--namespacens2--detailed-exitcode"}: helmexec.ExitError{Code: 2},
+				exectest.DiffKey{Name: "foo", Chart: "mychart1", Flags: "--kube-contextdefault--namespacens1--detailed-exitcode"}: helmexec.ExitError{Code: 2},
+			},
+			upgraded: []exectest.Release{
+				{Name: "bar", Flags: []string{"--kube-context", "default", "--namespace", "ns2"}},
+				{Name: "foo", Flags: []string{"--kube-context", "default", "--namespace", "ns1"}},
+			},
+		},
+		{
+			name: "upgrade when ns2/bar needs ns1/foo",
+			loc:  location(),
+			files: map[string]string{
+				"/path/to/helmfile.yaml": `
+releases:
+- name: bar
+  chart: mychart2
+  namespace: ns2
+  needs:
+  - ns1/foo
+- name: foo
+  chart: mychart1
+  namespace: ns1
+`,
+			},
+			diffs: map[exectest.DiffKey]error{
+				exectest.DiffKey{Name: "bar", Chart: "mychart2", Flags: "--kube-contextdefault--namespacens2--detailed-exitcode"}: helmexec.ExitError{Code: 2},
+				exectest.DiffKey{Name: "foo", Chart: "mychart1", Flags: "--kube-contextdefault--namespacens1--detailed-exitcode"}: helmexec.ExitError{Code: 2},
+			},
+			upgraded: []exectest.Release{
+				{Name: "foo", Flags: []string{"--kube-context", "default", "--namespace", "ns1"}},
+				{Name: "bar", Flags: []string{"--kube-context", "default", "--namespace", "ns2"}},
+			},
+		},
+		{
+			name: "upgrade when tns1/ns1/foo needs tns2/ns2/bar",
+			loc:  location(),
+
+			files: map[string]string{
+				"/path/to/helmfile.yaml": `
+releases:
+- name: foo
+  chart: mychart1
+  namespace: ns1
+  tillerNamespace: tns1
+  needs:
+  - tns2/ns2/bar
+- name: bar
+  chart: mychart2
+  namespace: ns2
+  tillerNamespace: tns2
+`,
+			},
+			diffs: map[exectest.DiffKey]error{
+				exectest.DiffKey{Name: "bar", Chart: "mychart2", Flags: "--tiller-namespacetns2--kube-contextdefault--namespacens2--detailed-exitcode"}: helmexec.ExitError{Code: 2},
+				exectest.DiffKey{Name: "foo", Chart: "mychart1", Flags: "--tiller-namespacetns1--kube-contextdefault--namespacens1--detailed-exitcode"}: helmexec.ExitError{Code: 2},
+			},
+			upgraded: []exectest.Release{
+				{Name: "bar", Flags: []string{"--tiller-namespace", "tns2", "--kube-context", "default", "--namespace", "ns2"}},
+				{Name: "foo", Flags: []string{"--tiller-namespace", "tns1", "--kube-context", "default", "--namespace", "ns1"}},
+			},
+		},
+		{
+			name: "upgrade when tns2/ns2/bar needs tns1/ns1/foo",
+			loc:  location(),
+			files: map[string]string{
+				"/path/to/helmfile.yaml": `
+releases:
+- name: bar
+  chart: mychart2
+  namespace: ns2
+  tillerNamespace: tns2
+  needs:
+  - tns1/ns1/foo
+- name: foo
+  chart: mychart1
+  namespace: ns1
+  tillerNamespace: tns1
+`,
+			},
+			diffs: map[exectest.DiffKey]error{
+				exectest.DiffKey{Name: "bar", Chart: "mychart2", Flags: "--tiller-namespacetns2--kube-contextdefault--namespacens2--detailed-exitcode"}: helmexec.ExitError{Code: 2},
+				exectest.DiffKey{Name: "foo", Chart: "mychart1", Flags: "--tiller-namespacetns1--kube-contextdefault--namespacens1--detailed-exitcode"}: helmexec.ExitError{Code: 2},
+			},
+			upgraded: []exectest.Release{
+				{Name: "foo", Flags: []string{"--tiller-namespace", "tns1", "--kube-context", "default", "--namespace", "ns1"}},
+				{Name: "bar", Flags: []string{"--tiller-namespace", "tns2", "--kube-context", "default", "--namespace", "ns2"}},
+			},
+			// as we check for log output, set concurrency to 1 to avoid non-deterministic test result
+			concurrency: 1,
+			log: `processing file "helmfile.yaml" in directory "."
+first-pass rendering starting for "helmfile.yaml.part.0": inherited=&{default map[] map[]}, overrode=<nil>
+first-pass uses: &{default map[] map[]}
+first-pass rendering output of "helmfile.yaml.part.0":
+ 0: 
+ 1: releases:
+ 2: - name: bar
+ 3:   chart: mychart2
+ 4:   namespace: ns2
+ 5:   tillerNamespace: tns2
+ 6:   needs:
+ 7:   - tns1/ns1/foo
+ 8: - name: foo
+ 9:   chart: mychart1
+10:   namespace: ns1
+11:   tillerNamespace: tns1
+12: 
+
+first-pass produced: &{default map[] map[]}
+first-pass rendering result of "helmfile.yaml.part.0": {default map[] map[]}
+vals:
+map[]
+defaultVals:[]
+second-pass rendering result of "helmfile.yaml.part.0":
+ 0: 
+ 1: releases:
+ 2: - name: bar
+ 3:   chart: mychart2
+ 4:   namespace: ns2
+ 5:   tillerNamespace: tns2
+ 6:   needs:
+ 7:   - tns1/ns1/foo
+ 8: - name: foo
+ 9:   chart: mychart1
+10:   namespace: ns1
+11:   tillerNamespace: tns1
+12: 
+
+merged environment: &{default map[] map[]}
+2 release(s) found in helmfile.yaml
+
+worker 1/1 started
+worker 1/1 finished
+worker 1/1 started
+worker 1/1 finished
+Affected releases are:
+  bar (mychart2) UPDATED
+  foo (mychart1) UPDATED
+
+processing 2 groups of releases in this order:
+GROUP RELEASES
+1     tns1/ns1/foo
+2     tns2/ns2/bar
+
+processing releases in group 1/2: tns1/ns1/foo
+worker 1/1 started
+worker 1/1 finished
+worker 1/1 started
+getting deployed release version failed:unexpected list key: {^foo$ --tiller-namespacetns1--kube-contextdefault--deployed--failed--pending}
+worker 1/1 finished
+processing releases in group 2/2: tns2/ns2/bar
+worker 1/1 started
+worker 1/1 finished
+worker 1/1 started
+getting deployed release version failed:unexpected list key: {^bar$ --tiller-namespacetns2--kube-contextdefault--deployed--failed--pending}
+worker 1/1 finished
+
+UPDATED RELEASES:
+NAME   CHART      VERSION
+foo    mychart1          
+bar    mychart2          
+
+`,
+		},
+		//
+		// deletes: deleting all releases in the correct order
+		//
+		{
+			name: "delete foo and bar when foo needs bar",
+			loc:  location(),
+			files: map[string]string{
+				"/path/to/helmfile.yaml": `
+releases:
+- name: bar
+  chart: mychart2
+  installed: false
+- name: foo
+  chart: mychart1
+  installed: false
+  needs:
+  - bar
+`,
+			},
+			diffs: map[exectest.DiffKey]error{
+				exectest.DiffKey{Name: "bar", Chart: "mychart2", Flags: "--kube-contextdefault--detailed-exitcode"}: helmexec.ExitError{Code: 2},
+				exectest.DiffKey{Name: "foo", Chart: "mychart1", Flags: "--kube-contextdefault--detailed-exitcode"}: helmexec.ExitError{Code: 2},
+			},
+			lists: map[exectest.ListKey]string{
+				exectest.ListKey{Filter: "^foo$", Flags: "--kube-contextdefault--deployed--failed--pending"}: `NAME	REVISION	UPDATED                 	STATUS  	CHART        	APP VERSION	NAMESPACE
+foo 	4       	Fri Nov  1 08:40:07 2019	DEPLOYED	mychart1-3.1.0	3.1.0      	default
+`,
+				exectest.ListKey{Filter: "^bar$", Flags: "--kube-contextdefault--deployed--failed--pending"}: `NAME	REVISION	UPDATED                 	STATUS  	CHART        	APP VERSION	NAMESPACE
+bar 	4       	Fri Nov  1 08:40:07 2019	DEPLOYED	mychart2-3.1.0	3.1.0      	default
+`,
+			},
+			deleted: []exectest.Release{
+				{Name: "foo", Flags: []string{}},
+				{Name: "bar", Flags: []string{}},
+			},
+		},
+		{
+			name: "delete foo and bar when bar needs foo",
+			loc:  location(),
+			files: map[string]string{
+				"/path/to/helmfile.yaml": `
+releases:
+- name: bar
+  chart: mychart2
+  installed: false
+  needs:
+  - foo
+- name: foo
+  chart: mychart1
+  installed: false
+`,
+			},
+			diffs: map[exectest.DiffKey]error{
+				exectest.DiffKey{Name: "bar", Chart: "mychart2", Flags: "--kube-contextdefault--detailed-exitcode"}: helmexec.ExitError{Code: 2},
+				exectest.DiffKey{Name: "foo", Chart: "mychart1", Flags: "--kube-contextdefault--detailed-exitcode"}: helmexec.ExitError{Code: 2},
+			},
+			lists: map[exectest.ListKey]string{
+				exectest.ListKey{Filter: "^foo$", Flags: "--kube-contextdefault--deployed--failed--pending"}: `NAME	REVISION	UPDATED                 	STATUS  	CHART        	APP VERSION	NAMESPACE
+foo 	4       	Fri Nov  1 08:40:07 2019	DEPLOYED	mychart1-3.1.0	3.1.0      	default
+`,
+				exectest.ListKey{Filter: "^bar$", Flags: "--kube-contextdefault--deployed--failed--pending"}: `NAME	REVISION	UPDATED                 	STATUS  	CHART        	APP VERSION	NAMESPACE
+bar 	4       	Fri Nov  1 08:40:07 2019	DEPLOYED	mychart2-3.1.0	3.1.0      	default
+`,
+			},
+			deleted: []exectest.Release{
+				{Name: "bar", Flags: []string{}},
+				{Name: "foo", Flags: []string{}},
+			},
+		},
+		//
+		// upgrade and delete: upgrading one while deleting another
+		//
+		{
+			name: "delete foo when foo needs bar",
+			loc:  location(),
+			files: map[string]string{
+				"/path/to/helmfile.yaml": `
+releases:
+- name: bar
+  chart: mychart2
+- name: foo
+  chart: mychart1
+  installed: false
+  needs:
+  - bar
+`,
+			},
+			diffs: map[exectest.DiffKey]error{
+				exectest.DiffKey{Name: "bar", Chart: "mychart2", Flags: "--kube-contextdefault--detailed-exitcode"}: helmexec.ExitError{Code: 2},
+				exectest.DiffKey{Name: "foo", Chart: "mychart1", Flags: "--kube-contextdefault--detailed-exitcode"}: helmexec.ExitError{Code: 2},
+			},
+			lists: map[exectest.ListKey]string{
+				exectest.ListKey{Filter: "^foo$", Flags: "--kube-contextdefault--deployed--failed--pending"}: `NAME	REVISION	UPDATED                 	STATUS  	CHART        	APP VERSION	NAMESPACE
+foo 	4       	Fri Nov  1 08:40:07 2019	DEPLOYED	mychart1-3.1.0	3.1.0      	default
+`,
+				exectest.ListKey{Filter: "^bar$", Flags: "--kube-contextdefault--deployed--failed--pending"}: `NAME	REVISION	UPDATED                 	STATUS  	CHART        	APP VERSION	NAMESPACE
+bar 	4       	Fri Nov  1 08:40:07 2019	DEPLOYED	mychart2-3.1.0	3.1.0      	default
+`,
+			},
+			upgraded: []exectest.Release{
+				{Name: "bar", Flags: []string{}},
+			},
+			deleted: []exectest.Release{
+				{Name: "foo", Flags: []string{}},
+			},
+		},
+		{
+			name: "delete bar when foo needs bar",
+			loc:  location(),
+			files: map[string]string{
+				"/path/to/helmfile.yaml": `
+releases:
+- name: bar
+  chart: mychart2
+  installed: false
+- name: foo
+  chart: mychart1
+  needs:
+  - bar
+`,
+			},
+			diffs: map[exectest.DiffKey]error{
+				exectest.DiffKey{Name: "bar", Chart: "mychart2", Flags: "--kube-contextdefault--detailed-exitcode"}: helmexec.ExitError{Code: 2},
+				exectest.DiffKey{Name: "foo", Chart: "mychart1", Flags: "--kube-contextdefault--detailed-exitcode"}: helmexec.ExitError{Code: 2},
+			},
+			lists: map[exectest.ListKey]string{
+				exectest.ListKey{Filter: "^foo$", Flags: "--kube-contextdefault--deployed--failed--pending"}: `NAME	REVISION	UPDATED                 	STATUS  	CHART        	APP VERSION	NAMESPACE
+foo 	4       	Fri Nov  1 08:40:07 2019	DEPLOYED	mychart1-3.1.0	3.1.0      	default
+`,
+				exectest.ListKey{Filter: "^bar$", Flags: "--kube-contextdefault--deployed--failed--pending"}: `NAME	REVISION	UPDATED                 	STATUS  	CHART        	APP VERSION	NAMESPACE
+bar 	4       	Fri Nov  1 08:40:07 2019	DEPLOYED	mychart2-3.1.0	3.1.0      	default
+`,
+			},
+			upgraded: []exectest.Release{
+				{Name: "foo", Flags: []string{}},
+			},
+			deleted: []exectest.Release{
+				{Name: "bar", Flags: []string{}},
+			},
+		},
+		{
+			name: "delete foo when bar needs foo",
+			loc:  location(),
+			files: map[string]string{
+				"/path/to/helmfile.yaml": `
+releases:
+- name: foo
+  chart: mychart1
+  installed: false
+- name: bar
+  chart: mychart2
+  needs:
+  - foo
+`,
+			},
+			diffs: map[exectest.DiffKey]error{
+				exectest.DiffKey{Name: "bar", Chart: "mychart2", Flags: "--kube-contextdefault--detailed-exitcode"}: helmexec.ExitError{Code: 2},
+				exectest.DiffKey{Name: "foo", Chart: "mychart1", Flags: "--kube-contextdefault--detailed-exitcode"}: helmexec.ExitError{Code: 2},
+			},
+			lists: map[exectest.ListKey]string{
+				exectest.ListKey{Filter: "^foo$", Flags: "--kube-contextdefault--deployed--failed--pending"}: `NAME	REVISION	UPDATED                 	STATUS  	CHART        	APP VERSION	NAMESPACE
+foo 	4       	Fri Nov  1 08:40:07 2019	DEPLOYED	mychart1-3.1.0	3.1.0      	default
+`,
+				exectest.ListKey{Filter: "^bar$", Flags: "--kube-contextdefault--deployed--failed--pending"}: `NAME	REVISION	UPDATED                 	STATUS  	CHART        	APP VERSION	NAMESPACE
+bar 	4       	Fri Nov  1 08:40:07 2019	DEPLOYED	mychart2-3.1.0	3.1.0      	default
+`,
+			},
+			upgraded: []exectest.Release{
+				{Name: "bar", Flags: []string{}},
+			},
+			deleted: []exectest.Release{
+				{Name: "foo", Flags: []string{}},
+			},
+		},
+		{
+			name: "delete bar when bar needs foo",
+			loc:  location(),
+			files: map[string]string{
+				"/path/to/helmfile.yaml": `
+releases:
+- name: foo
+  chart: mychart1
+- name: bar
+  chart: mychart2
+  installed: false
+  needs:
+  - foo
+`,
+			},
+			diffs: map[exectest.DiffKey]error{
+				exectest.DiffKey{Name: "bar", Chart: "mychart2", Flags: "--kube-contextdefault--detailed-exitcode"}: helmexec.ExitError{Code: 2},
+				exectest.DiffKey{Name: "foo", Chart: "mychart1", Flags: "--kube-contextdefault--detailed-exitcode"}: helmexec.ExitError{Code: 2},
+			},
+			lists: map[exectest.ListKey]string{
+				exectest.ListKey{Filter: "^foo$", Flags: "--kube-contextdefault--deployed--failed--pending"}: `NAME	REVISION	UPDATED                 	STATUS  	CHART        	APP VERSION	NAMESPACE
+foo 	4       	Fri Nov  1 08:40:07 2019	DEPLOYED	mychart1-3.1.0	3.1.0      	default
+`,
+				exectest.ListKey{Filter: "^bar$", Flags: "--kube-contextdefault--deployed--failed--pending"}: `NAME	REVISION	UPDATED                 	STATUS  	CHART        	APP VERSION	NAMESPACE
+bar 	4       	Fri Nov  1 08:40:07 2019	DEPLOYED	mychart2-3.1.0	3.1.0      	default
+`,
+			},
+			upgraded: []exectest.Release{
+				{Name: "foo", Flags: []string{}},
+			},
+			deleted: []exectest.Release{
+				{Name: "bar", Flags: []string{}},
+			},
+		},
+		//
+		// upgrades with selector
+		//
+		{
+			// see https://github.com/roboll/helmfile/issues/919#issuecomment-549831747
+			name: "upgrades with good selector",
+			loc:  location(),
+			files: map[string]string{
+				"/path/to/helmfile.yaml": `
+{{ $mark := "a" }}
+
+releases:
+- name: kubernetes-external-secrets
+  chart: incubator/raw
+  namespace: kube-system
+
+- name: external-secrets
+  chart: incubator/raw
+  namespace: default
+  labels:
+    app: test
+  needs:
+  - kube-system/kubernetes-external-secrets
+
+- name: my-release
+  chart: incubator/raw
+  namespace: default
+  labels:
+    app: test
+  needs:
+  - default/external-secrets
+`,
+			},
+			selectors: []string{"app=test"},
+			diffs: map[exectest.DiffKey]error{
+				exectest.DiffKey{Name: "external-secrets", Chart: "incubator/raw", Flags: "--kube-contextdefault--namespacedefault--detailed-exitcode"}: helmexec.ExitError{Code: 2},
+				exectest.DiffKey{Name: "my-release", Chart: "incubator/raw", Flags: "--kube-contextdefault--namespacedefault--detailed-exitcode"}:       helmexec.ExitError{Code: 2},
+			},
+			upgraded: []exectest.Release{
+				{Name: "external-secrets", Flags: []string{"--kube-context", "default", "--namespace", "default"}},
+				{Name: "my-release", Flags: []string{"--kube-context", "default", "--namespace", "default"}},
+			},
+			// as we check for log output, set concurrency to 1 to avoid non-deterministic test result
+			concurrency: 1,
+			log: `processing file "helmfile.yaml" in directory "."
+first-pass rendering starting for "helmfile.yaml.part.0": inherited=&{default map[] map[]}, overrode=<nil>
+first-pass uses: &{default map[] map[]}
+first-pass rendering output of "helmfile.yaml.part.0":
+ 0: 
+ 1: 
+ 2: 
+ 3: releases:
+ 4: - name: kubernetes-external-secrets
+ 5:   chart: incubator/raw
+ 6:   namespace: kube-system
+ 7: 
+ 8: - name: external-secrets
+ 9:   chart: incubator/raw
+10:   namespace: default
+11:   labels:
+12:     app: test
+13:   needs:
+14:   - kube-system/kubernetes-external-secrets
+15: 
+16: - name: my-release
+17:   chart: incubator/raw
+18:   namespace: default
+19:   labels:
+20:     app: test
+21:   needs:
+22:   - default/external-secrets
+23: 
+
+first-pass produced: &{default map[] map[]}
+first-pass rendering result of "helmfile.yaml.part.0": {default map[] map[]}
+vals:
+map[]
+defaultVals:[]
+second-pass rendering result of "helmfile.yaml.part.0":
+ 0: 
+ 1: 
+ 2: 
+ 3: releases:
+ 4: - name: kubernetes-external-secrets
+ 5:   chart: incubator/raw
+ 6:   namespace: kube-system
+ 7: 
+ 8: - name: external-secrets
+ 9:   chart: incubator/raw
+10:   namespace: default
+11:   labels:
+12:     app: test
+13:   needs:
+14:   - kube-system/kubernetes-external-secrets
+15: 
+16: - name: my-release
+17:   chart: incubator/raw
+18:   namespace: default
+19:   labels:
+20:     app: test
+21:   needs:
+22:   - default/external-secrets
+23: 
+
+merged environment: &{default map[] map[]}
+2 release(s) matching app=test found in helmfile.yaml
+
+worker 1/1 started
+worker 1/1 finished
+worker 1/1 started
+worker 1/1 finished
+Affected releases are:
+  external-secrets (incubator/raw) UPDATED
+  my-release (incubator/raw) UPDATED
+
+processing 3 groups of releases in this order:
+GROUP RELEASES
+1     kube-system/kubernetes-external-secrets
+2     default/external-secrets
+3     default/my-release
+
+processing releases in group 1/3: kube-system/kubernetes-external-secrets
+0 release(s) matching app=test found in helmfile.yaml
+
+processing releases in group 2/3: default/external-secrets
+1 release(s) matching app=test found in helmfile.yaml
+
+worker 1/1 started
+worker 1/1 finished
+worker 1/1 started
+getting deployed release version failed:unexpected list key: {^external-secrets$ --kube-contextdefault--deployed--failed--pending}
+worker 1/1 finished
+processing releases in group 3/3: default/my-release
+1 release(s) matching app=test found in helmfile.yaml
+
+worker 1/1 started
+worker 1/1 finished
+worker 1/1 started
+getting deployed release version failed:unexpected list key: {^my-release$ --kube-contextdefault--deployed--failed--pending}
+worker 1/1 finished
+
+UPDATED RELEASES:
+NAME               CHART           VERSION
+external-secrets   incubator/raw          
+my-release         incubator/raw          
+
+`,
+		},
+		{
+			// see https://github.com/roboll/helmfile/issues/919#issuecomment-549831747
+			name: "upgrades with bad selector",
+			loc:  location(),
+			files: map[string]string{
+				"/path/to/helmfile.yaml": `
+{{ $mark := "a" }}
+
+releases:
+- name: kubernetes-external-secrets
+  chart: incubator/raw
+  namespace: kube-system
+
+- name: external-secrets
+  chart: incubator/raw
+  namespace: default
+  labels:
+    app: test
+  needs:
+  - kube-system/kubernetes-external-secrets
+
+- name: my-release
+  chart: incubator/raw
+  namespace: default
+  labels:
+    app: test
+  needs:
+  - default/external-secrets
+`,
+			},
+			selectors: []string{"app=test_non_existent"},
+			diffs:     map[exectest.DiffKey]error{},
+			upgraded:  []exectest.Release{},
+			error:     "err: no releases found that matches specified selector(app=test_non_existent) and environment(default), in any helmfile",
+			// as we check for log output, set concurrency to 1 to avoid non-deterministic test result
+			concurrency: 1,
+			log: `processing file "helmfile.yaml" in directory "."
+first-pass rendering starting for "helmfile.yaml.part.0": inherited=&{default map[] map[]}, overrode=<nil>
+first-pass uses: &{default map[] map[]}
+first-pass rendering output of "helmfile.yaml.part.0":
+ 0: 
+ 1: 
+ 2: 
+ 3: releases:
+ 4: - name: kubernetes-external-secrets
+ 5:   chart: incubator/raw
+ 6:   namespace: kube-system
+ 7: 
+ 8: - name: external-secrets
+ 9:   chart: incubator/raw
+10:   namespace: default
+11:   labels:
+12:     app: test
+13:   needs:
+14:   - kube-system/kubernetes-external-secrets
+15: 
+16: - name: my-release
+17:   chart: incubator/raw
+18:   namespace: default
+19:   labels:
+20:     app: test
+21:   needs:
+22:   - default/external-secrets
+23: 
+
+first-pass produced: &{default map[] map[]}
+first-pass rendering result of "helmfile.yaml.part.0": {default map[] map[]}
+vals:
+map[]
+defaultVals:[]
+second-pass rendering result of "helmfile.yaml.part.0":
+ 0: 
+ 1: 
+ 2: 
+ 3: releases:
+ 4: - name: kubernetes-external-secrets
+ 5:   chart: incubator/raw
+ 6:   namespace: kube-system
+ 7: 
+ 8: - name: external-secrets
+ 9:   chart: incubator/raw
+10:   namespace: default
+11:   labels:
+12:     app: test
+13:   needs:
+14:   - kube-system/kubernetes-external-secrets
+15: 
+16: - name: my-release
+17:   chart: incubator/raw
+18:   namespace: default
+19:   labels:
+20:     app: test
+21:   needs:
+22:   - default/external-secrets
+23: 
+
+merged environment: &{default map[] map[]}
+0 release(s) matching app=test_non_existent found in helmfile.yaml
+
+`,
+		},
+		//
+		// error cases
+		//
+		{
+			name: "non-existent release in needs",
+			loc:  location(),
+			files: map[string]string{
+				"/path/to/helmfile.yaml": `
+releases:
+- name: baz
+  namespace: ns1
+  chart: mychart3
+- name: foo
+  chart: mychart1
+  needs:
+  - bar
+`,
+			},
+			diffs: map[exectest.DiffKey]error{
+				exectest.DiffKey{Name: "baz", Chart: "mychart3", Flags: "--kube-contextdefault--namespacens1--detailed-exitcode"}: helmexec.ExitError{Code: 2},
+				exectest.DiffKey{Name: "foo", Chart: "mychart1", Flags: "--kube-contextdefault--detailed-exitcode"}:               helmexec.ExitError{Code: 2},
+			},
+			lists:       map[exectest.ListKey]string{},
+			upgraded:    []exectest.Release{},
+			deleted:     []exectest.Release{},
+			concurrency: 1,
+			error:       `in ./helmfile.yaml: "foo" depends on nonexistent release "bar"`,
+			log: `processing file "helmfile.yaml" in directory "."
+first-pass rendering starting for "helmfile.yaml.part.0": inherited=&{default map[] map[]}, overrode=<nil>
+first-pass uses: &{default map[] map[]}
+first-pass rendering output of "helmfile.yaml.part.0":
+ 0: 
+ 1: releases:
+ 2: - name: baz
+ 3:   namespace: ns1
+ 4:   chart: mychart3
+ 5: - name: foo
+ 6:   chart: mychart1
+ 7:   needs:
+ 8:   - bar
+ 9: 
+
+first-pass produced: &{default map[] map[]}
+first-pass rendering result of "helmfile.yaml.part.0": {default map[] map[]}
+vals:
+map[]
+defaultVals:[]
+second-pass rendering result of "helmfile.yaml.part.0":
+ 0: 
+ 1: releases:
+ 2: - name: baz
+ 3:   namespace: ns1
+ 4:   chart: mychart3
+ 5: - name: foo
+ 6:   chart: mychart1
+ 7:   needs:
+ 8:   - bar
+ 9: 
+
+merged environment: &{default map[] map[]}
+2 release(s) found in helmfile.yaml
+
+worker 1/1 started
+worker 1/1 finished
+worker 1/1 started
+worker 1/1 finished
+Affected releases are:
+  baz (mychart3) UPDATED
+  foo (mychart1) UPDATED
+
+err: "foo" depends on nonexistent release "bar"
+`,
+		},
+	}
+
+	for i := range testcases {
+		tc := testcases[i]
+		t.Run(tc.name, func(t *testing.T) {
+			wantUpgrades := tc.upgraded
+			wantDeletes := tc.deleted
+
+			var helm = &exectest.Helm{
+				FailOnUnexpectedList: true,
+				FailOnUnexpectedDiff: true,
+				Lists:                tc.lists,
+				Diffs:                tc.diffs,
+				DiffMutex:            &sync.Mutex{},
+				ChartsMutex:          &sync.Mutex{},
+				ReleasesMutex:        &sync.Mutex{},
+			}
+
+			bs := &bytes.Buffer{}
+
+			func() {
+				logReader, logWriter := io.Pipe()
+
+				logFlushed := &sync.WaitGroup{}
+				// Ensure all the log is consumed into `bs` by calling `logWriter.Close()` followed by `logFlushed.Wait()`
+				logFlushed.Add(1)
+				go func() {
+					scanner := bufio.NewScanner(logReader)
+					for scanner.Scan() {
+						bs.Write(scanner.Bytes())
+						bs.WriteString("\n")
+					}
+					logFlushed.Done()
+				}()
+
+				defer func() {
+					// This is here to avoid data-trace on bytes buffer `bs` to capture logs
+					if err := logWriter.Close(); err != nil {
+						panic(err)
+					}
+					logFlushed.Wait()
+				}()
+
+				logger := helmexec.NewLogger(logWriter, "debug")
+
+				valsRuntime, err := vals.New(vals.Options{CacheSize: 32})
+				if err != nil {
+					t.Errorf("unexpected error creating vals runtime: %v", err)
+				}
+
+				app := appWithFs(&App{
+					OverrideHelmBinary:  DefaultHelmBinary,
+					glob:                filepath.Glob,
+					abs:                 filepath.Abs,
+					OverrideKubeContext: "default",
+					Env:                 "default",
+					Logger:              logger,
+					helms: map[helmKey]helmexec.Interface{
+						createHelmKey("helm", "default"): helm,
+					},
+					valsRuntime: valsRuntime,
+				}, tc.files)
+
+				if tc.ns != "" {
+					app.Namespace = tc.ns
+				}
+
+				if tc.selectors != nil {
+					app.Selectors = tc.selectors
+				}
+
+				applyErr := app.Apply(applyConfig{
+					// if we check log output, concurrency must be 1. otherwise the test becomes non-deterministic.
+					concurrency: tc.concurrency,
+					logger:      logger,
+				})
+				if tc.error == "" && applyErr != nil {
+					t.Fatalf("unexpected error for data defined at %s: %v", tc.loc, applyErr)
+				} else if tc.error != "" && applyErr == nil {
+					t.Fatalf("expected error did not occur for data defined at %s", tc.loc)
+				} else if tc.error != "" && applyErr != nil && tc.error != applyErr.Error() {
+					t.Fatalf("invalid error: expected %q, got %q", tc.error, applyErr.Error())
+				}
+
+				if len(wantUpgrades) > len(helm.Releases) {
+					t.Fatalf("insufficient number of upgrades: got %d, want %d", len(helm.Releases), len(wantUpgrades))
+				}
+
+				for relIdx := range wantUpgrades {
+					if wantUpgrades[relIdx].Name != helm.Releases[relIdx].Name {
+						t.Errorf("releases[%d].name: got %q, want %q", relIdx, helm.Releases[relIdx].Name, wantUpgrades[relIdx].Name)
+					}
+					for flagIdx := range wantUpgrades[relIdx].Flags {
+						if wantUpgrades[relIdx].Flags[flagIdx] != helm.Releases[relIdx].Flags[flagIdx] {
+							t.Errorf("releaes[%d].flags[%d]: got %v, want %v", relIdx, flagIdx, helm.Releases[relIdx].Flags[flagIdx], wantUpgrades[relIdx].Flags[flagIdx])
+						}
+					}
+				}
+
+				if len(wantDeletes) > len(helm.Deleted) {
+					t.Fatalf("insufficient number of deletes: got %d, want %d", len(helm.Deleted), len(wantDeletes))
+				}
+
+				for relIdx := range wantDeletes {
+					if wantDeletes[relIdx].Name != helm.Deleted[relIdx].Name {
+						t.Errorf("releases[%d].name: got %q, want %q", relIdx, helm.Deleted[relIdx].Name, wantDeletes[relIdx].Name)
+					}
+					for flagIdx := range wantDeletes[relIdx].Flags {
+						if wantDeletes[relIdx].Flags[flagIdx] != helm.Deleted[relIdx].Flags[flagIdx] {
+							t.Errorf("releaes[%d].flags[%d]: got %v, want %v", relIdx, flagIdx, helm.Deleted[relIdx].Flags[flagIdx], wantDeletes[relIdx].Flags[flagIdx])
+						}
+					}
+				}
+			}()
+
+			if tc.log != "" {
+				actual := bs.String()
+
+				diff, exists := testhelper.Diff(tc.log, actual, 3)
+				if exists {
+					t.Errorf("unexpected log for data defined %s:\nDIFF\n%s\nEOD", tc.loc, diff)
+				}
+			}
+		})
+	}
+}
+
+func captureStdout(f func()) string {
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		panic(err)
+	}
+	stdout := os.Stdout
+	defer func() {
+		os.Stdout = stdout
+		log.SetOutput(os.Stderr)
+	}()
+	os.Stdout = writer
+	log.SetOutput(writer)
+	out := make(chan string)
+	wg := new(sync.WaitGroup)
+	wg.Add(1)
+	go func() {
+		var buf bytes.Buffer
+		wg.Done()
+		io.Copy(&buf, reader)
+		out <- buf.String()
+	}()
+	wg.Wait()
+	f()
+	writer.Close()
+	return <-out
+}
+
+func TestPrint_SingleStateFile(t *testing.T) {
+	files := map[string]string{
+		"/path/to/helmfile.yaml": `
+releases:
+- name: myrelease1
+  chart: mychart1
+- name: myrelease2
+  chart: mychart1
+`,
+	}
+	stdout := os.Stdout
+	defer func() { os.Stdout = stdout }()
+
+	var buffer bytes.Buffer
+	logger := helmexec.NewLogger(&buffer, "debug")
+
+	app := appWithFs(&App{
+		OverrideHelmBinary:  DefaultHelmBinary,
+		glob:                filepath.Glob,
+		abs:                 filepath.Abs,
+		OverrideKubeContext: "default",
+		Env:                 "default",
+		Logger:              logger,
+		Namespace:           "testNamespace",
+	}, files)
+
+	out := captureStdout(func() {
+		err := app.PrintState(configImpl{})
+		assert.NilError(t, err)
+	})
+	assert.Assert(t, strings.Count(out, "---") == 1,
+		"state should contain '---' yaml doc separator:\n%s\n", out)
+	assert.Assert(t, strings.Contains(out, "helmfile.yaml"),
+		"state should contain source helmfile name:\n%s\n", out)
+	assert.Assert(t, strings.Contains(out, "name: myrelease1"),
+		"state should contain releases:\n%s\n", out)
+}
+
+func TestPrint_MultiStateFile(t *testing.T) {
+	files := map[string]string{
+		"/path/to/helmfile.d/first.yaml": `
+releases:
+- name: myrelease1
+  chart: mychart1
+- name: myrelease2
+  chart: mychart1
+`,
+		"/path/to/helmfile.d/second.yaml": `
+releases:
+- name: myrelease3
+  chart: mychart1
+- name: myrelease4
+  chart: mychart1
+`,
+	}
+	stdout := os.Stdout
+	defer func() { os.Stdout = stdout }()
+
+	var buffer bytes.Buffer
+	logger := helmexec.NewLogger(&buffer, "debug")
+
+	app := appWithFs(&App{
+		OverrideHelmBinary:  DefaultHelmBinary,
+		glob:                filepath.Glob,
+		abs:                 filepath.Abs,
+		OverrideKubeContext: "default",
+		Env:                 "default",
+		Logger:              logger,
+		Namespace:           "testNamespace",
+	}, files)
+	out := captureStdout(func() {
+		err := app.PrintState(configImpl{})
+		assert.NilError(t, err)
+	})
+	assert.Assert(t, strings.Count(out, "---") == 2,
+		"state should contain '---' yaml doc separators:\n%s\n", out)
+	assert.Assert(t, strings.Contains(out, "second.yaml"),
+		"state should contain source helmfile name:\n%s\n", out)
+	assert.Assert(t, strings.Contains(out, "second.yaml"),
+		"state should contain source helmfile name:\n%s\n", out)
+}
+
+func TestList(t *testing.T) {
+	files := map[string]string{
+		"/path/to/helmfile.d/first.yaml": `
+releases:
+- name: myrelease1
+  chart: mychart1
+  installed: no
+  labels:
+    id: myrelease1
+- name: myrelease2
+  chart: mychart1
+`,
+		"/path/to/helmfile.d/second.yaml": `
+releases:
+- name: myrelease3
+  chart: mychart1
+  installed: yes
+- name: myrelease4
+  chart: mychart1
+  labels:
+    id: myrelease1
+`,
+	}
+	stdout := os.Stdout
+	defer func() { os.Stdout = stdout }()
+
+	var buffer bytes.Buffer
+	logger := helmexec.NewLogger(&buffer, "debug")
+
+	app := appWithFs(&App{
+		OverrideHelmBinary:  DefaultHelmBinary,
+		glob:                filepath.Glob,
+		abs:                 filepath.Abs,
+		OverrideKubeContext: "default",
+		Env:                 "default",
+		Logger:              logger,
+		Namespace:           "testNamespace",
+	}, files)
+
+	expectNoCallsToHelm(app)
+
+	out := captureStdout(func() {
+		err := app.ListReleases(configImpl{})
+		assert.NilError(t, err)
+	})
+
+	expected := `NAME      	NAMESPACE	ENABLED	LABELS       
+myrelease1	         	false  	id:myrelease1
+myrelease2	         	true   	             
+myrelease3	         	true   	             
+myrelease4	         	true   	id:myrelease1
+`
+	assert.Equal(t, expected, out)
+}
+
+func TestSetValuesTemplate(t *testing.T) {
+	files := map[string]string{
+		"/path/to/helmfile.yaml": `
+releases:
+- name: zipkin
+  chart: stable/zipkin
+  values:
+  - val2: "val2"
+  valuesTemplate:
+  - val1: '{{"{{ .Release.Name }}"}}'
+  set:
+  - name: "name"
+    value: "val"
+  setTemplate:
+  - name: name-{{"{{ .Release.Name }}"}}
+    value: val-{{"{{ .Release.Name }}"}}
+`,
+	}
+	expectedValues := []interface{}{
+		map[interface{}]interface{}{"val1": "zipkin"},
+		map[interface{}]interface{}{"val2": "val2"}}
+	expectedSetValues := []state.SetValue{
+		state.SetValue{Name: "name-zipkin", Value: "val-zipkin"},
+		state.SetValue{Name: "name", Value: "val"}}
+
+	app := appWithFs(&App{
+		OverrideHelmBinary:  DefaultHelmBinary,
+		OverrideKubeContext: "default",
+		Logger:              helmexec.NewLogger(os.Stderr, "debug"),
+		Env:                 "default",
+	}, files)
+
+	var specs []state.ReleaseSpec
+	collectReleases := func(st *state.HelmState) []error {
+		specs = append(specs, st.Releases...)
+		return nil
+	}
+
+	err := app.VisitDesiredStatesWithReleasesFiltered(
+		"helmfile.yaml", collectReleases,
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(specs) != 1 {
+		t.Fatalf("expected 1 release; got %d releases", len(specs))
+	}
+	actualValues := specs[0].Values
+	actualSetValues := specs[0].SetValues
+
+	if !reflect.DeepEqual(expectedValues, actualValues) {
+		t.Errorf("expected values: %v; got values: %v", expectedValues, actualValues)
+	}
+	if !reflect.DeepEqual(expectedSetValues, actualSetValues) {
+		t.Errorf("expected set: %v; got set: %v", expectedValues, actualValues)
+	}
+}
+
+func location() string {
+	_, fn, line, _ := runtime.Caller(1)
+	return fmt.Sprintf("%s:%d", filepath.Base(fn), line)
 }
