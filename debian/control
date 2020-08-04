@@ -1,0 +1,25 @@
+Source: helmfile
+Section: devel
+Priority: optional
+Maintainer: Wikimedia Service Operations Go Team <sre-service-ops@wikimedia.org>
+Build-Depends: debhelper-compat (= 12),
+               dh-golang,
+               golang-any (>= 2:1.13),
+               git,
+Standards-Version: 4.1.3
+Homepage: https://github.com/roboll/helmfile
+Vcs-Browser: https://gerrit.wikimedia.org/r/operations/debs/helmfile
+Vcs-Git: https://gerrit.wikimedia.org/r/operations/debs/helmfile.git
+XS-Go-Import-Path: github.com/roboll/helmfile
+
+Package: helmfile
+Architecture: any
+Built-Using: ${misc:Built-Using}
+Depends: ${shlibs:Depends},
+         ${misc:Depends}
+Description: Deploy Kubernetes Helm Charts
+ Helmfile is a declarative spec for deploying helm charts. It lets you...
+ .
+ Keep a directory of chart value files and maintain changes in version control.
+ Apply CI/CD to configuration changes.
+ Periodically sync to avoid skew in environments.

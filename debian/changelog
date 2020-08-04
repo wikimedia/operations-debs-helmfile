@@ -1,0 +1,31 @@
+helmfile (0.125.2-0) buster-wikimedia; urgency=medium
+
+  * New upstream version 0.125.2
+
+ -- Janis Meybohm <jmeybohm@wikimedia.org>  Tue, 04 Aug 2020 10:57:18 +0200
+
+helmfile (0.109.0-1) buster-backports; urgency=medium
+
+  * Non-maintainer upload.
+  * Bump to version 0.109.0
+  * Fix debianization issues
+
+ -- Alexandros Kosiaris <akosiaris@wikimedia.org>  Mon, 13 Apr 2020 17:10:53 +0300
+
+helmfile (0.66.0-2) UNRELEASED; urgency=medium
+
+  * Ignore .gitreview in source tree.
+
+ -- Antoine Musso <hashar@free.fr>  Fri, 12 Jul 2019 11:33:53 +0200
+
+helmfile (0.66.0-1) buster; urgency=medium
+
+  * Bumping version to 0.66.0.
+
+ -- Fabian Selles <fsero@wikimedia.org>  Tue, 18 Jun 2019 17:00:23 +0200
+
+helmfile (0.57.0-1) buster; urgency=medium
+
+  * Initial WMF debianization.
+
+ -- Fabian Selles <fsero@wikimedia.org>  Tue, 09 Apr 2019 17:00:23 +0200

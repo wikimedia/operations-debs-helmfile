@@ -1,0 +1,73 @@
+#!/bin/bash
+set -exo pipefail
+# Script to clone helmfile and repack it as a tar.xz
+# It uses git, tar, xz.
+# Copyright 2019 Wikimedia Foundation Inc.
+# Under Apache 2.0 license.
+dest_dir=$PWD
+working_dir="$(mktemp -d)"
+
+function usage() {
+cat <<EOF
+Usage: $0 [<tag_from_github>]
+
+If no tag is selected, the latest one will be used.
+EOF
+}
+
+
+function cleanup_exit() {
+    rc=$?
+    rm -rf "${working_dir}"
+    echo "Cleaned up working directory ‘${working_dir}’"
+    exit $rc
+}
+trap cleanup_exit ERR EXIT SIGTERM SIGHUP SIGINT SIGQUIT
+
+function clone_repo() {
+    pushd "$working_dir"
+    git clone https://github.com/roboll/helmfile.git
+    popd
+}
+
+function get_latest_tag() {
+    cd "${working_dir}/helmfile" && git describe --tags | cut -d- -f1
+}
+
+function create_archive() {
+    # Remove the "v" at the start of the tag.
+    version=${1//v}
+    pushd "$working_dir"/helmfile
+    outfile="${dest_dir}/helmfile_${version}.orig.tar.xz"
+    git archive --format=tar repack | xz > "$outfile"
+    echo "Archive saved to $outfile. Use gbp import-orig to import it."
+    popd
+}
+
+function checkout_tag() {
+    pushd "$working_dir"/helmfile
+    git checkout -b repack "$1"
+    echo "Checked out $1 as branch 'repack'."
+    echo "You may want to do 'go mod vendor' here."
+    echo "Commit necessary changes here and quit the shell to create a tarball."
+    /bin/bash
+    popd
+}
+
+if [ $# -gt 1 ]; then
+    usage
+    exit 1
+fi
+
+echo "Cloning the repository..."
+clone_repo
+
+if [ -z $1 ]; then
+    TAG=$(get_latest_tag)
+else
+    TAG=$1
+fi
+
+checkout_tag "$TAG"
+
+create_archive "$TAG"
