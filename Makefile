@@ -2,7 +2,7 @@ ORG     ?= $(shell basename $(realpath ..))
 PKGS    := $(shell go list ./... | grep -v /vendor/)
 
 build:
-	go build ${TARGETS}
+	go build -ldflags '-X github.com/roboll/helmfile/pkg/app/version.Version=${TAG}' ${TARGETS}
 .PHONY: build
 
 generate:
@@ -16,6 +16,10 @@ fmt:
 check:
 	go vet ${PKGS}
 .PHONY: check
+
+build-test-tools:
+	go build test/diff-yamls.go
+.PHONY: build-test-tools
 
 test:
 	go test -v ${PKGS} -cover -race -p=1

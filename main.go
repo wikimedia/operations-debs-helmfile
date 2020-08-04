@@ -13,7 +13,6 @@ import (
 	"github.com/roboll/helmfile/pkg/state"
 	"github.com/urfave/cli"
 	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
 )
 
 var logger *zap.SugaredLogger
@@ -22,13 +21,10 @@ func configureLogging(c *cli.Context) error {
 	// Valid levels:
 	// https://github.com/uber-go/zap/blob/7e7e266a8dbce911a49554b945538c5b950196b8/zapcore/level.go#L126
 	logLevel := c.GlobalString("log-level")
-	if c.GlobalBool("quiet") {
+	if c.GlobalBool("debug") {
+		logLevel = "debug"
+	} else if c.GlobalBool("quiet") {
 		logLevel = "warn"
-	}
-	var level zapcore.Level
-	err := level.Set(logLevel)
-	if err != nil {
-		return err
 	}
 	logger = helmexec.NewLogger(os.Stderr, logLevel)
 	if c.App.Metadata == nil {
@@ -75,6 +71,10 @@ func main() {
 		cli.StringFlag{
 			Name:  "kube-context",
 			Usage: "Set kubectl context. Uses current context by default",
+		},
+		cli.BoolFlag{
+			Name:  "debug",
+			Usage: "Enable verbose output for Helm and set log-level to debug, this disables --quiet/-q effect",
 		},
 		cli.BoolFlag{
 			Name:  "no-color",
@@ -234,6 +234,10 @@ func main() {
 				cli.StringFlag{
 					Name:  "output-dir",
 					Usage: "output directory to pass to helm template (helm template --output-dir)",
+				},
+				cli.StringFlag{
+					Name:  "output-dir-template",
+					Usage: "go text template for generating the output directory. Default: {{ .OutputDir }}/{{ .State.BaseName }}-{{ .State.AbsPathSHA1 }}-{{ .Release.Name}}",
 				},
 				cli.IntFlag{
 					Name:  "concurrency",
@@ -471,10 +475,25 @@ func main() {
 		{
 			Name:  "list",
 			Usage: "list releases defined in state file",
-			Flags: []cli.Flag{},
+			Flags: []cli.Flag{
+				cli.StringFlag{
+					Name:  "output",
+					Value: "",
+					Usage: "output releases list as a json string",
+				},
+			},
 			Action: action(func(run *app.App, c configImpl) error {
 				return run.ListReleases(c)
 			}),
+		},
+		{
+			Name:      "version",
+			Usage:     "Show the version for Helmfile.",
+			ArgsUsage: "[command]",
+			Action: func(c *cli.Context) error {
+				cli.ShowVersion(c)
+				return nil
+			},
 		},
 	}
 
@@ -533,11 +552,21 @@ func (c configImpl) Values() []string {
 }
 
 func (c configImpl) Args() string {
-	return c.c.String("args")
+	args := c.c.String("args")
+	enableHelmDebug := c.c.GlobalBool("debug")
+
+	if enableHelmDebug {
+		args = fmt.Sprintf("%s %s", args, "--debug")
+	}
+	return args
 }
 
 func (c configImpl) OutputDir() string {
 	return c.c.String("output-dir")
+}
+
+func (c configImpl) OutputDirTemplate() string {
+	return c.c.String("output-dir-template")
 }
 
 func (c configImpl) Validate() bool {
@@ -591,7 +620,16 @@ func (c configImpl) Cleanup() bool {
 }
 
 func (c configImpl) Timeout() int {
+	if !c.c.IsSet("timeout") {
+		return state.EmptyTimeout
+	}
 	return c.c.Int("timeout")
+}
+
+// ListConfig
+
+func (c configImpl) Output() string {
+	return c.c.String("output")
 }
 
 // GlobalConfig

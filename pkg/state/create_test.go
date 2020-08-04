@@ -1,7 +1,9 @@
 package state
 
 import (
+	"github.com/roboll/helmfile/pkg/remote"
 	"io/ioutil"
+	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
@@ -9,8 +11,8 @@ import (
 	"github.com/roboll/helmfile/pkg/testhelper"
 	"go.uber.org/zap"
 
-	. "gotest.tools/assert"
-	"gotest.tools/assert/cmp"
+	. "gotest.tools/v3/assert"
+	"gotest.tools/v3/assert/cmp"
 )
 
 func createFromYaml(content []byte, file string, env string, logger *zap.SugaredLogger) (*HelmState, error) {
@@ -18,7 +20,9 @@ func createFromYaml(content []byte, file string, env string, logger *zap.Sugared
 		logger:   logger,
 		readFile: ioutil.ReadFile,
 		abs:      filepath.Abs,
-		Strict:   true,
+
+		DeleteFile: os.Remove,
+		Strict:     true,
 	}
 	return c.ParseAndLoad(content, filepath.Dir(file), file, env, true, nil)
 }
@@ -108,7 +112,9 @@ bar: {{ readFile "bar.txt" }}
 	})
 	testFs.Cwd = "/example/path/to"
 
-	state, err := NewCreator(logger, testFs.ReadFile, testFs.FileExists, testFs.Abs, testFs.Glob, nil, nil, "").ParseAndLoad(yamlContent, filepath.Dir(yamlFile), yamlFile, "production", true, nil)
+	r := remote.NewRemote(logger, testFs.Cwd, testFs.ReadFile, testFs.DirectoryExistsAt, testFs.FileExistsAt)
+	state, err := NewCreator(logger, testFs.ReadFile, testFs.FileExists, testFs.Abs, testFs.Glob, nil, nil, "", r).
+		ParseAndLoad(yamlContent, filepath.Dir(yamlFile), yamlFile, "production", true, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
