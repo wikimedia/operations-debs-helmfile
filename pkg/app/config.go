@@ -129,6 +129,7 @@ type TemplateConfigProvider interface {
 
 	Values() []string
 	Set() []string
+	OutputDirTemplate() string
 	Validate() bool
 	SkipDeps() bool
 	OutputDir() string
@@ -155,4 +156,8 @@ type loggingConfig interface {
 
 type interactive interface {
 	Interactive() bool
+}
+
+type ListConfigProvider interface {
+	Output() string
 }

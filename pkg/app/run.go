@@ -5,6 +5,8 @@ import (
 	"github.com/roboll/helmfile/pkg/argparser"
 	"github.com/roboll/helmfile/pkg/helmexec"
 	"github.com/roboll/helmfile/pkg/state"
+	"io/ioutil"
+	"os"
 	"sort"
 	"strings"
 )
@@ -14,10 +16,16 @@ type Run struct {
 	helm  helmexec.Interface
 	ctx   Context
 
+	ReleaseToChart map[string]string
+
 	Ask func(string) bool
 }
 
 func NewRun(st *state.HelmState, helm helmexec.Interface, ctx Context) *Run {
+	if helm == nil {
+		panic("Assertion failed: helmexec.Interface must not be nil")
+	}
+
 	return &Run{state: st, helm: helm, ctx: ctx}
 }
 
@@ -28,19 +36,59 @@ func (r *Run) askForConfirmation(msg string) bool {
 	return AskForConfirmation(msg)
 }
 
-func (r *Run) Deps(c DepsConfigProvider) []error {
-	r.helm.SetExtraArgs(argparser.GetArgs(c.Args(), r.state)...)
+func (r *Run) withPreparedCharts(forceDownload, skipRepos bool, helmfileCommand string, f func()) error {
+	if r.ReleaseToChart != nil {
+		panic("Run.PrepareCharts can be called only once")
+	}
 
-	if !c.SkipRepos() {
-		if errs := r.ctx.SyncReposOnce(r.state, r.helm); errs != nil && len(errs) > 0 {
-			return errs
+	if !skipRepos {
+		ctx := r.ctx
+		if err := ctx.SyncReposOnce(r.state, r.helm); err != nil {
+			return err
 		}
 	}
+
+	// Create tmp directory and bail immediately if it fails
+	dir, err := ioutil.TempDir("", "")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dir)
+
+	if _, err = r.state.TriggerGlobalPrepareEvent(helmfileCommand); err != nil {
+		return err
+	}
+
+	releaseToChart, errs := r.state.PrepareCharts(r.helm, dir, 2, helmfileCommand, forceDownload)
+
+	if len(errs) > 0 {
+		return fmt.Errorf("%v", errs)
+	}
+
+	for i := range r.state.Releases {
+		rel := &r.state.Releases[i]
+
+		if chart := releaseToChart[rel.Name]; chart != "" {
+			rel.Chart = chart
+		}
+	}
+
+	r.ReleaseToChart = releaseToChart
+
+	f()
+
+	_, err = r.state.TriggerGlobalCleanupEvent(helmfileCommand)
+
+	return err
+}
+
+func (r *Run) Deps(c DepsConfigProvider) []error {
+	r.helm.SetExtraArgs(argparser.GetArgs(c.Args(), r.state)...)
 
 	return r.state.UpdateDeps(r.helm)
 }
 
-func (r *Run) Repos(c ReposConfigProvider) []error {
+func (r *Run) Repos(c ReposConfigProvider) error {
 	r.helm.SetExtraArgs(argparser.GetArgs(c.Args(), r.state)...)
 
 	return r.ctx.SyncReposOnce(r.state, r.helm)
@@ -64,14 +112,13 @@ func (r *Run) Status(c StatusesConfigProvider) []error {
 	return r.state.ReleaseStatuses(r.helm, workers)
 }
 
-func (r *Run) Diff(c DiffConfigProvider) (*string, bool, bool, []error) {
+func (a *App) diff(r *Run, c DiffConfigProvider) (*string, bool, bool, []error) {
 	st := r.state
 	helm := r.helm
-	ctx := r.ctx
 
 	allReleases := st.GetReleasesWithOverrides()
 
-	toDiff, err := st.GetSelectedReleasesWithOverrides()
+	toDiff, err := a.getSelectedReleases(r)
 	if err != nil {
 		return nil, false, false, []error{err}
 	}
@@ -85,9 +132,6 @@ func (r *Run) Diff(c DiffConfigProvider) (*string, bool, bool, []error) {
 	st.Releases = toDiff
 
 	if !c.SkipDeps() {
-		if errs := ctx.SyncReposOnce(st, helm); errs != nil && len(errs) > 0 {
-			return nil, false, false, errs
-		}
 		if errs := st.BuildDeps(helm); errs != nil && len(errs) > 0 {
 			return nil, false, false, errs
 		}
@@ -140,15 +184,11 @@ func (r *Run) Test(c TestConfigProvider) []error {
 func (r *Run) Lint(c LintConfigProvider) []error {
 	st := r.state
 	helm := r.helm
-	ctx := r.ctx
 
 	values := c.Values()
 	args := argparser.GetArgs(c.Args(), st)
 	workers := c.Concurrency()
 	if !c.SkipDeps() {
-		if errs := ctx.SyncReposOnce(st, helm); errs != nil && len(errs) > 0 {
-			return errs
-		}
 		if errs := st.BuildDeps(helm); errs != nil && len(errs) > 0 {
 			return errs
 		}
