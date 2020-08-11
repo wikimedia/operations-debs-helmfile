@@ -1,0 +1,66 @@
+From: jayme-github <jayme-github@users.noreply.github.com>
+Date: Tue, 11 Aug 2020 15:30:31 +0200
+Subject: Set helm extra args early
+
+The extra aguments for helm are set pretty late which leads to errors
+then using `helmDefauls.args: "--kubeconfig ..."` as thats needed for
+helm commands run earlier in the code as well.
+---
+ pkg/app/app.go | 9 +++------
+ 1 file changed, 3 insertions(+), 6 deletions(-)
+
+diff --git a/pkg/app/app.go b/pkg/app/app.go
+index f4e9ca2..9859a6b 100644
+--- a/pkg/app/app.go
++++ b/pkg/app/app.go
+@@ -955,6 +955,7 @@ func (a *App) getSelectedReleases(r *Run) ([]state.ReleaseSpec, error) {
+ func (a *App) apply(r *Run, c ApplyConfigProvider) (bool, bool, []error) {
+ 	st := r.state
+ 	helm := r.helm
++	helm.SetExtraArgs(argparser.GetArgs(c.Args(), st)...)
+ 
+ 	allReleases := st.GetReleasesWithOverrides()
+ 
+@@ -1020,8 +1021,6 @@ Do you really want to apply?
+ 	st.Releases = allReleases
+ 
+ 	if !interactive || interactive && r.askForConfirmation(confMsg) {
+-		r.helm.SetExtraArgs(argparser.GetArgs(c.Args(), r.state)...)
+-
+ 		// We deleted releases by traversing the DAG in reverse order
+ 		if len(releasesToBeDeleted) > 0 {
+ 			_, deletionErrs := withDAG(st, helm, a.Logger, true, a.Wrap(func(subst *state.HelmState, helm helmexec.Interface) []error {
+@@ -1075,6 +1074,7 @@ Do you really want to apply?
+ func (a *App) delete(r *Run, purge bool, c DestroyConfigProvider) (bool, []error) {
+ 	st := r.state
+ 	helm := r.helm
++	helm.SetExtraArgs(argparser.GetArgs(c.Args(), st)...)
+ 
+ 	affectedReleases := state.AffectedReleases{}
+ 
+@@ -1113,8 +1113,6 @@ Do you really want to delete?
+ `, strings.Join(names, "\n"))
+ 	interactive := c.Interactive()
+ 	if !interactive || interactive && r.askForConfirmation(msg) {
+-		r.helm.SetExtraArgs(argparser.GetArgs(c.Args(), r.state)...)
+-
+ 		if len(releasesToDelete) > 0 {
+ 			_, deletionErrs := withDAG(st, helm, a.Logger, true, a.Wrap(func(subst *state.HelmState, helm helmexec.Interface) []error {
+ 				var rs []state.ReleaseSpec
+@@ -1142,6 +1140,7 @@ Do you really want to delete?
+ func (a *App) sync(r *Run, c SyncConfigProvider) (bool, []error) {
+ 	st := r.state
+ 	helm := r.helm
++	helm.SetExtraArgs(argparser.GetArgs(c.Args(), st)...)
+ 
+ 	allReleases := st.GetReleasesWithOverrides()
+ 
+@@ -1208,8 +1207,6 @@ func (a *App) sync(r *Run, c SyncConfigProvider) (bool, []error) {
+ 
+ 	var errs []error
+ 
+-	r.helm.SetExtraArgs(argparser.GetArgs(c.Args(), r.state)...)
+-
+ 	// Traverse DAG of all the releases so that we don't suffer from false-positive missing dependencies
+ 	st.Releases = allReleases
+ 

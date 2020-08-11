@@ -1,3 +1,11 @@
+helmfile (0.125.2-1) UNRELEASED; urgency=medium
+
+  * Fix an issue with helmDefaults argument set to late (e.g. not applied to
+    helm list commands during helmfile apply/sync).
+    See: https://github.com/roboll/helmfile/pull/1411
+
+ -- Janis Meybohm <jmeybohm@wikimedia.org>  Tue, 11 Aug 2020 15:55:54 +0200
+
 helmfile (0.125.2-0) buster-wikimedia; urgency=medium
 
   * New upstream version 0.125.2
