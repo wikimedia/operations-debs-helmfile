@@ -1,4 +1,4 @@
-helmfile (0.125.2-1) UNRELEASED; urgency=medium
+helmfile (0.125.2-1) buster-wikimedia; urgency=medium
 
   * Fix an issue with helmDefaults argument set to late (e.g. not applied to
     helm list commands during helmfile apply/sync).
