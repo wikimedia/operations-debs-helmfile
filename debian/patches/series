@@ -1,1 +1,2 @@
 0001-Set-helm-extra-args-early.patch
+0002-Don-t-append-tiller-namespace-flag-when-running-helm.patch

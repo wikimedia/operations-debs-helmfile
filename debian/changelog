@@ -1,3 +1,11 @@
+helmfile (0.135.0-1) buster-wikimedia; urgency=medium
+
+  * New upstream version 0.135.0
+  * Don't append --tiller-namespace flag when running helm3.
+    See: https://github.com/roboll/helmfile/pull/1594
+
+ -- Janis Meybohm <jmeybohm@wikimedia.org>  Tue, 24 Nov 2020 13:04:19 +0100
+
 helmfile (0.125.2-1) buster-wikimedia; urgency=medium
 
   * Fix an issue with helmDefaults argument set to late (e.g. not applied to
