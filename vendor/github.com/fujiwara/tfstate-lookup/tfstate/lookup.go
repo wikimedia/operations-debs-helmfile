@@ -8,6 +8,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/itchyny/gojq"
@@ -78,7 +79,7 @@ type tfstate struct {
 
 type backend struct {
 	Type   string `json:"type"`
-	Config map[string]*string
+	Config map[string]interface{}
 }
 
 type resource struct {
@@ -179,6 +180,7 @@ func (s *TFState) List() ([]string, error) {
 	for key := range s.state.Outputs {
 		names = append(names, "output."+key)
 	}
+	sort.Strings(names)
 	for _, r := range s.state.Resources {
 		var module string
 		if r.Module != "" {
@@ -188,7 +190,7 @@ func (s *TFState) List() ([]string, error) {
 		case "data":
 			names = append(names, module+fmt.Sprintf("data.%s.%s", r.Type, r.Name))
 		case "managed":
-			if r.Each != "" {
+			if r.Each == "map" || r.Each == "list" || (r.Each == "" && len(r.Instances) > 1) {
 				for _, i := range r.Instances {
 					names = append(names,
 						module+fmt.Sprintf("%s.%s[%s]", r.Type, r.Name, string(i.IndexKey)),
@@ -208,7 +210,7 @@ func parseAddress(key string) (selectorFunc, string, error) {
 	var selector selectorFunc
 	var query string
 
-	parts := strings.Split(key, ".")
+	parts := makeParts(key)
 	if len(parts) < 2 ||
 		parts[0] == "module" && len(parts) < 4 ||
 		parts[0] == "data" && len(parts) < 3 {
@@ -217,8 +219,13 @@ func parseAddress(key string) (selectorFunc, string, error) {
 
 	var module string
 	if parts[0] == "module" {
-		module = "module." + parts[1]
-		parts = parts[2:] // remove module prefix
+		for i := len(parts) - 1; i >= 0; i-- {
+			if parts[i] == "module" {
+				module = strings.Join(parts[0:i+2], ".")
+				parts = parts[i+2:] // remove module prefix
+				break
+			}
+		}
 	}
 	if parts[0] == "data" {
 		selector = func(r resource) *instance {
@@ -230,12 +237,11 @@ func parseAddress(key string) (selectorFunc, string, error) {
 		query = "." + strings.Join(parts[3:], ".")
 	} else {
 		n := parts[1] // foo, foo["bar"], foo[0]
-
 		if i := strings.Index(n, "["); i != -1 { // each
 			indexKey := n[i+1 : len(n)-1] // "bar", 0
 			name := n[0:i]                // foo
 			selector = func(r resource) *instance {
-				if r.Module == module && r.Mode == "managed" && r.Type == parts[0] && r.Name == name && (r.Each == "map" || r.Each == "list") {
+				if r.Module == module && r.Mode == "managed" && r.Type == parts[0] && r.Name == name && (r.Each == "map" || r.Each == "list" || r.Each == "") {
 					for _, i := range r.Instances {
 						if bytes.Equal(i.IndexKey, []byte(indexKey)) {
 							instance := i
@@ -265,4 +271,28 @@ func noneNil(args ...interface{}) interface{} {
 		}
 	}
 	return nil
+}
+
+func makeParts(key string) []string {
+	var parts []string
+	index := 0
+	inBrackets := false
+	for _, s := range strings.Split(key, "") {
+		if len(parts) < index+1 {
+			parts = append(parts, "")
+		}
+		if s == "[" {
+			inBrackets = true
+		}
+		if s == "]" {
+			inBrackets = false
+		}
+		if s != "." || inBrackets {
+			parts[index] += s
+		}
+		if s == "." && !inBrackets {
+			index++
+		}
+	}
+	return parts
 }
