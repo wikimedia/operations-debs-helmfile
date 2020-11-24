@@ -7,8 +7,9 @@ import (
 	"strings"
 )
 
-func RunCommand(cmd string, args []string, stdout, stderr io.Writer, env map[string]string) error {
+func RunCommand(cmd string, args []string, dir string, stdout, stderr io.Writer, env map[string]string) error {
 	command := exec.Command(cmd, args...)
+	command.Dir = dir
 	command.Stdout = stdout
 	command.Stderr = stderr
 	command.Env = mergeEnv(os.Environ(), env)
@@ -39,4 +40,3 @@ func env2map(env []string) map[string]string {
 	}
 	return wanted
 }
-

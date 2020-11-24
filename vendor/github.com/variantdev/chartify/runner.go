@@ -5,14 +5,13 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"k8s.io/klog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 )
 
-type RunCommandFunc func(name string, args []string, stdout, stderr io.Writer, env map[string]string) error
+type RunCommandFunc func(name string, args []string, dir string, stdout, stderr io.Writer, env map[string]string) error
 
 type Runner struct {
 	// HelmBinary is the name or the path to `helm` command
@@ -21,7 +20,7 @@ type Runner struct {
 	// KustomizeBinary is the name or the path to `kustomize` command
 	KustomizeBinary string
 
-	isHelm3    bool
+	isHelm3 bool
 
 	RunCommand RunCommandFunc
 
@@ -32,6 +31,9 @@ type Runner struct {
 	Walk        func(root string, walkFn filepath.WalkFunc) error
 	MakeTempDir func() string
 	Exists      func(path string) (bool, error)
+
+	// Logf is the alternative log function used by chartify
+	Logf func(string, ...interface{})
 }
 
 type Option func(*Runner) error
@@ -50,6 +52,13 @@ func UseHelm3(u bool) Option {
 	}
 }
 
+func WithLogf(logf func(string, ...interface{})) Option {
+	return func(r *Runner) error {
+		r.Logf = logf
+		return nil
+	}
+}
+
 func New(opts ...Option) *Runner {
 	r := &Runner{
 		KustomizeBinary: "",
@@ -60,8 +69,13 @@ func New(opts ...Option) *Runner {
 		ReadDir:         ioutil.ReadDir,
 		Walk:            filepath.Walk,
 		Exists:          exists,
+		Logf:            printf,
 		MakeTempDir: func() string {
-			return mkRandomDir(os.TempDir())
+			d, err := ioutil.TempDir(os.TempDir(), "chartify")
+			if err != nil {
+				panic(err)
+			}
+			return d
 		},
 	}
 
@@ -89,7 +103,7 @@ func (r *Runner) kustomizeBin() string {
 }
 
 func (r *Runner) run(cmd string, args ...string) (string, error) {
-	bytes, err := r.runBytes(cmd, args...)
+	bytes, err := r.runBytes("", cmd, args...)
 
 	var out string
 
@@ -100,7 +114,19 @@ func (r *Runner) run(cmd string, args ...string) (string, error) {
 	return out, err
 }
 
-func (r *Runner) runBytes(cmd string, args ...string) ([]byte, error) {
+func (r *Runner) runInDir(dir, cmd string, args ...string) (string, error) {
+	bytes, err := r.runBytes(dir, cmd, args...)
+
+	var out string
+
+	if bytes != nil {
+		out = string(bytes)
+	}
+
+	return out, err
+}
+
+func (r *Runner) runBytes(dir, cmd string, args ...string) ([]byte, error) {
 	nameArgs := strings.Split(cmd, " ")
 
 	name := nameArgs[0]
@@ -112,7 +138,7 @@ func (r *Runner) runBytes(cmd string, args ...string) ([]byte, error) {
 		args = a
 	}
 
-	bytes, errBytes, err := r.captureBytes(name, args)
+	bytes, errBytes, err := r.captureBytes(name, args, dir)
 	if err != nil {
 		c := strings.Join(append([]string{name}, args...), " ")
 
@@ -153,17 +179,21 @@ func (r *Runner) IsHelm3() bool {
 	return strings.HasPrefix(out, "v3.")
 }
 
-func (r *Runner) captureBytes(binary string, args []string) ([]byte, []byte, error) {
-	klog.V(1).Infof("running %s %s", binary, strings.Join(args, " "))
+func (r *Runner) captureBytes(binary string, args []string, dir string) ([]byte, []byte, error) {
+	r.Logf("running %s %s", binary, strings.Join(args, " "))
 	_, err := exec.LookPath(binary)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	var stdout, stderr bytes.Buffer
-	err = r.RunCommand(binary, args, &stdout, &stderr, map[string]string{})
+	err = r.RunCommand(binary, args, dir, &stdout, &stderr, map[string]string{})
 	if err != nil {
-		klog.V(1).Info(stderr.String())
+		r.Logf(stderr.String())
 	}
 	return stdout.Bytes(), stderr.Bytes(), err
+}
+
+func printf(format string, vars ...interface{}) {
+	fmt.Fprintf(os.Stderr, format+"\n", vars...)
 }

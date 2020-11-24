@@ -10,12 +10,12 @@ import (
 
 func (d *Differ) diffInt(path []string, a, b reflect.Value) error {
 	if a.Kind() == reflect.Invalid {
-		d.cl.add(CREATE, path, nil, b.Interface())
+		d.cl.Add(CREATE, path, nil, b.Interface())
 		return nil
 	}
 
 	if b.Kind() == reflect.Invalid {
-		d.cl.add(DELETE, path, a.Interface(), nil)
+		d.cl.Add(DELETE, path, a.Interface(), nil)
 		return nil
 	}
 
@@ -24,7 +24,11 @@ func (d *Differ) diffInt(path []string, a, b reflect.Value) error {
 	}
 
 	if a.Int() != b.Int() {
-		d.cl.add(UPDATE, path, a.Interface(), b.Interface())
+		if a.CanInterface() {
+			d.cl.Add(UPDATE, path, a.Interface(), b.Interface())
+		} else {
+			d.cl.Add(UPDATE, path, a.Int(), b.Int())
+		}
 	}
 
 	return nil

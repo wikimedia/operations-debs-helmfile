@@ -4,13 +4,12 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"github.com/roboll/helmfile/pkg/helmexec"
-	"github.com/roboll/helmfile/pkg/remote"
 	"path/filepath"
-	"sort"
 
 	"github.com/imdario/mergo"
 	"github.com/roboll/helmfile/pkg/environment"
+	"github.com/roboll/helmfile/pkg/helmexec"
+	"github.com/roboll/helmfile/pkg/remote"
 	"github.com/roboll/helmfile/pkg/state"
 	"github.com/variantdev/vals"
 	"go.uber.org/zap"
@@ -27,12 +26,13 @@ type desiredStateLoader struct {
 	env       string
 	namespace string
 
-	readFile   func(string) ([]byte, error)
-	deleteFile func(string) error
-	fileExists func(string) (bool, error)
-	abs        func(string) (string, error)
-	glob       func(string) ([]string, error)
-	getHelm    func(*state.HelmState) helmexec.Interface
+	readFile          func(string) ([]byte, error)
+	deleteFile        func(string) error
+	fileExists        func(string) (bool, error)
+	abs               func(string) (string, error)
+	glob              func(string) ([]string, error)
+	directoryExistsAt func(string) bool
+	getHelm           func(*state.HelmState) helmexec.Interface
 
 	remote      *remote.Remote
 	logger      *zap.SugaredLogger
@@ -68,11 +68,7 @@ func (ld *desiredStateLoader) Load(f string, opts LoadOpts) (*state.HelmState, e
 	}
 
 	if opts.Reverse {
-		rev := func(i, j int) bool {
-			return j < i
-		}
-		sort.Slice(st.Releases, rev)
-		sort.Slice(st.Helmfiles, rev)
+		st.Reverse()
 	}
 
 	if ld.overrideKubeContext != "" {
@@ -150,7 +146,7 @@ func (ld *desiredStateLoader) loadFileWithOverrides(inheritedEnv, overrodeEnv *e
 }
 
 func (a *desiredStateLoader) underlying() *state.StateCreator {
-	c := state.NewCreator(a.logger, a.readFile, a.fileExists, a.abs, a.glob, a.valsRuntime, a.getHelm, a.overrideHelmBinary, a.remote)
+	c := state.NewCreator(a.logger, a.readFile, a.fileExists, a.abs, a.glob, a.directoryExistsAt, a.valsRuntime, a.getHelm, a.overrideHelmBinary, a.remote)
 	c.DeleteFile = a.deleteFile
 	c.LoadFile = a.loadFile
 	return c
@@ -222,9 +218,11 @@ func (ld *desiredStateLoader) renderAndLoad(env, overrodeEnv *environment.Enviro
 		if finalState == nil {
 			finalState = currentState
 		} else {
-			if err := mergo.Merge(finalState, currentState, mergo.WithOverride); err != nil {
+			if err := mergo.Merge(&finalState.ReleaseSetSpec, &currentState.ReleaseSetSpec, mergo.WithOverride); err != nil {
 				return nil, err
 			}
+
+			finalState.RenderedValues = currentState.RenderedValues
 		}
 
 		env = &finalState.Env

@@ -41,6 +41,7 @@ type KustomizeBuildOpts struct {
 	ValuesFiles        []string
 	SetValues          []string
 	EnableAlphaPlugins bool
+	Namespace          string
 }
 
 func (o *KustomizeBuildOpts) SetKustomizeBuildOption(opts *KustomizeBuildOpts) error {
@@ -72,20 +73,16 @@ func (r *Runner) KustomizeBuild(srcDir string, tempDir string, opts ...Kustomize
 		}
 	}
 
+	if u.Namespace != "" {
+		kustomizeOpts.Namespace = u.Namespace
+	}
+
 	if len(u.SetValues) > 0 {
 		panic("--set is not yet supported for kustomize-based apps! Use -f/--values flag instead.")
 	}
 
 	prevDir, err := os.Getwd()
 	if err != nil {
-		return "", err
-	}
-	defer func() {
-		if err := os.Chdir(prevDir); err != nil {
-			panic(err)
-		}
-	}()
-	if err := os.Chdir(tempDir); err != nil {
 		return "", err
 	}
 
@@ -98,7 +95,8 @@ func (r *Runner) KustomizeBuild(srcDir string, tempDir string, opts ...Kustomize
 		return "", err
 	}
 	baseFile := []byte("bases:\n- " + relPath + "\n")
-	if err := r.WriteFile(path.Join(tempDir, "kustomization.yaml"), baseFile, 0644); err != nil {
+	kustomizationPath := path.Join(tempDir, "kustomization.yaml")
+	if err := r.WriteFile(kustomizationPath, baseFile, 0644); err != nil {
 		return "", err
 	}
 
@@ -107,13 +105,13 @@ func (r *Runner) KustomizeBuild(srcDir string, tempDir string, opts ...Kustomize
 		for _, image := range kustomizeOpts.Images {
 			args = append(args, image.String())
 		}
-		_, err := r.run(r.kustomizeBin(), args...)
+		_, err := r.runInDir(tempDir, r.kustomizeBin(), args...)
 		if err != nil {
 			return "", err
 		}
 	}
 	if kustomizeOpts.NamePrefix != "" {
-		_, err := r.run(r.kustomizeBin(), "edit", "set", "nameprefix", kustomizeOpts.NamePrefix)
+		_, err := r.runInDir(tempDir, r.kustomizeBin(), "edit", "set", "nameprefix", kustomizeOpts.NamePrefix)
 		if err != nil {
 			fmt.Println(err)
 			return "", err
@@ -121,27 +119,31 @@ func (r *Runner) KustomizeBuild(srcDir string, tempDir string, opts ...Kustomize
 	}
 	if kustomizeOpts.NameSuffix != "" {
 		// "--" is there to avoid `namesuffix -acme` to fail due to `-a` being considered as a flag
-		_, err := r.run(r.kustomizeBin(), "edit", "set", "namesuffix", "--", kustomizeOpts.NameSuffix)
+		_, err := r.runInDir(tempDir, r.kustomizeBin(), "edit", "set", "namesuffix", "--", kustomizeOpts.NameSuffix)
 		if err != nil {
 			return "", err
 		}
 	}
 	if kustomizeOpts.Namespace != "" {
-		_, err := r.run(r.kustomizeBin(), "edit", "set", "namespace", kustomizeOpts.Namespace)
+		_, err := r.runInDir(tempDir, r.kustomizeBin(), "edit", "set", "namespace", kustomizeOpts.Namespace)
 		if err != nil {
 			return "", err
 		}
 	}
-	kustomizeFile := filepath.Join(tempDir, "kustomized.yaml")
-	kustomizeArgs := []string{"-o", kustomizeFile, "build", "--load_restrictor=none"}
+	outputFile := filepath.Join(tempDir, "templates", "kustomized.yaml")
+	kustomizeArgs := []string{"-o", outputFile, "build", "--load_restrictor=none"}
 	if u.EnableAlphaPlugins {
 		kustomizeArgs = append(kustomizeArgs, "--enable_alpha_plugins")
 	}
-	out, err := r.run(r.kustomizeBin(), append(kustomizeArgs, tempDir)...)
+	out, err := r.runInDir(tempDir, r.kustomizeBin(), append(kustomizeArgs, tempDir)...)
 	if err != nil {
 		return "", err
 	}
 	fmt.Println(out)
 
-	return kustomizeFile, nil
+	if err := os.RemoveAll(kustomizationPath); err != nil {
+		return "", fmt.Errorf("removing unnecessary kustomization.yaml after build: %v", err)
+	}
+
+	return outputFile, nil
 }

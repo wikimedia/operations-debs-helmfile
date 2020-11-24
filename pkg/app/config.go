@@ -51,6 +51,7 @@ type ApplyConfigProvider interface {
 	Context() int
 
 	RetainValuesFiles() bool
+	SkipCleanup() bool
 
 	concurrencyConfig
 	interactive
@@ -110,6 +111,7 @@ type TestConfigProvider interface {
 
 	Timeout() int
 	Cleanup() bool
+	Logs() bool
 
 	concurrencyConfig
 }
@@ -132,9 +134,18 @@ type TemplateConfigProvider interface {
 	OutputDirTemplate() string
 	Validate() bool
 	SkipDeps() bool
+	SkipCleanup() bool
 	OutputDir() string
+	IncludeCRDs() bool
 
 	concurrencyConfig
+}
+
+type WriteValuesConfigProvider interface {
+	Values() []string
+	Set() []string
+	OutputFileTemplate() string
+	SkipDeps() bool
 }
 
 type StatusesConfigProvider interface {
@@ -144,6 +155,7 @@ type StatusesConfigProvider interface {
 }
 
 type StateConfigProvider interface {
+	EmbedValues() bool
 }
 
 type concurrencyConfig interface {

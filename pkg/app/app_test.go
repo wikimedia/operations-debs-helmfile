@@ -4,8 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
-	"github.com/google/go-cmp/cmp"
-	"github.com/roboll/helmfile/pkg/remote"
 	"io"
 	"log"
 	"os"
@@ -16,6 +14,9 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/google/go-cmp/cmp"
+	"github.com/roboll/helmfile/pkg/remote"
 
 	"github.com/roboll/helmfile/pkg/exectest"
 	"gotest.tools/v3/assert"
@@ -746,6 +747,8 @@ func runFilterSubHelmFilesTests(testcases []struct {
 	expectErr        bool
 	errMsg           string
 }, files map[string]string, t *testing.T, testName string) {
+	t.Helper()
+
 	for _, testcase := range testcases {
 		actual := []string{}
 
@@ -2234,9 +2237,16 @@ services:
 }
 
 type configImpl struct {
-	set      []string
-	output   string
-	skipDeps bool
+	selectors   []string
+	set         []string
+	output      string
+	includeCRDs bool
+	skipCleanup bool
+	skipDeps    bool
+}
+
+func (a configImpl) Selectors() []string {
+	return a.selectors
 }
 
 func (c configImpl) Set() []string {
@@ -2255,6 +2265,10 @@ func (c configImpl) Validate() bool {
 	return true
 }
 
+func (c configImpl) SkipCleanup() bool {
+	return c.skipCleanup
+}
+
 func (c configImpl) SkipDeps() bool {
 	return c.skipDeps
 }
@@ -2267,8 +2281,16 @@ func (c configImpl) OutputDirTemplate() string {
 	return ""
 }
 
+func (c configImpl) IncludeCRDs() bool {
+	return c.includeCRDs
+}
+
 func (c configImpl) Concurrency() int {
 	return 1
+}
+
+func (c configImpl) EmbedValues() bool {
+	return false
 }
 
 func (c configImpl) Output() string {
@@ -2281,6 +2303,7 @@ type applyConfig struct {
 	retainValuesFiles bool
 	set               []string
 	validate          bool
+	skipCleanup       bool
 	skipDeps          bool
 	includeTests      bool
 	suppressSecrets   bool
@@ -2307,6 +2330,10 @@ func (a applyConfig) Set() []string {
 
 func (a applyConfig) Validate() bool {
 	return a.validate
+}
+
+func (a applyConfig) SkipCleanup() bool {
+	return a.skipCleanup
 }
 
 func (a applyConfig) SkipDeps() bool {
@@ -2351,6 +2378,18 @@ func (a applyConfig) Logger() *zap.SugaredLogger {
 
 func (a applyConfig) RetainValuesFiles() bool {
 	return a.retainValuesFiles
+}
+
+type depsConfig struct {
+	skipRepos bool
+}
+
+func (d depsConfig) SkipRepos() bool {
+	return d.skipRepos
+}
+
+func (d depsConfig) Args() string {
+	return ""
 }
 
 // Mocking the command-line runner
@@ -2411,7 +2450,7 @@ func (helm *mockHelmExec) SetExtraArgs(args ...string) {
 func (helm *mockHelmExec) SetHelmBinary(bin string) {
 	return
 }
-func (helm *mockHelmExec) AddRepo(name, repository, cafile, certfile, keyfile, username, password string) error {
+func (helm *mockHelmExec) AddRepo(name, repository, cafile, certfile, keyfile, username, password string, managed string) error {
 	helm.repos = append(helm.repos, mockRepo{Name: name})
 	return nil
 }
@@ -2455,7 +2494,7 @@ func (helm *mockHelmExec) GetVersion() helmexec.Version {
 	return helmexec.Version{}
 }
 
-func (helm *mockHelmExec) IsVersionAtLeast(major int, minor int) bool {
+func (helm *mockHelmExec) IsVersionAtLeast(versionStr string) bool {
 	return false
 }
 
@@ -2490,6 +2529,7 @@ releases:
 
 	var wantRepos = []mockRepo{
 		{Name: "stable"},
+		{Name: "stable2"},
 	}
 
 	var buffer bytes.Buffer
@@ -3933,6 +3973,147 @@ err: "foo" depends on nonexistent release "bar"
 	}
 }
 
+func TestDeps(t *testing.T) {
+	testcases := []struct {
+		name   string
+		loc    string
+		error  string
+		files  map[string]string
+		log    string
+		charts []string
+	}{
+		//
+		// complex test cases for smoke testing
+		//
+		{
+			name: "smoke",
+			loc:  location(),
+			files: map[string]string{
+				"/path/to/helmfile.yaml": `
+repositories:
+- name: bitnami
+  url: https://charts.bitnami.com/bitnami/
+releases:
+- name: example
+  chart: /path/to/charts/example
+`,
+				"/path/to/charts/example/Chart.yaml": `foo: FOO`,
+			},
+			log: `processing file "helmfile.yaml" in directory "."
+first-pass rendering starting for "helmfile.yaml.part.0": inherited=&{default map[] map[]}, overrode=<nil>
+first-pass uses: &{default map[] map[]}
+first-pass rendering output of "helmfile.yaml.part.0":
+ 0: 
+ 1: repositories:
+ 2: - name: bitnami
+ 3:   url: https://charts.bitnami.com/bitnami/
+ 4: releases:
+ 5: - name: example
+ 6:   chart: /path/to/charts/example
+ 7: 
+
+first-pass produced: &{default map[] map[]}
+first-pass rendering result of "helmfile.yaml.part.0": {default map[] map[]}
+vals:
+map[]
+defaultVals:[]
+second-pass rendering result of "helmfile.yaml.part.0":
+ 0: 
+ 1: repositories:
+ 2: - name: bitnami
+ 3:   url: https://charts.bitnami.com/bitnami/
+ 4: releases:
+ 5: - name: example
+ 6:   chart: /path/to/charts/example
+ 7: 
+
+merged environment: &{default map[] map[]}
+There are no repositories defined in your helmfile.yaml.
+This means helmfile cannot update your dependencies or create a lock file.
+See https://github.com/roboll/helmfile/issues/878 for more information.
+`,
+			charts: []string{"/path/to/charts/example"},
+		},
+	}
+
+	for i := range testcases {
+		tc := testcases[i]
+		t.Run(tc.name, func(t *testing.T) {
+
+			var helm = &exectest.Helm{
+				DiffMutex:     &sync.Mutex{},
+				ChartsMutex:   &sync.Mutex{},
+				ReleasesMutex: &sync.Mutex{},
+			}
+
+			bs := &bytes.Buffer{}
+
+			func() {
+				logReader, logWriter := io.Pipe()
+
+				logFlushed := &sync.WaitGroup{}
+				// Ensure all the log is consumed into `bs` by calling `logWriter.Close()` followed by `logFlushed.Wait()`
+				logFlushed.Add(1)
+				go func() {
+					scanner := bufio.NewScanner(logReader)
+					for scanner.Scan() {
+						bs.Write(scanner.Bytes())
+						bs.WriteString("\n")
+					}
+					logFlushed.Done()
+				}()
+
+				defer func() {
+					// This is here to avoid data-trace on bytes buffer `bs` to capture logs
+					if err := logWriter.Close(); err != nil {
+						panic(err)
+					}
+					logFlushed.Wait()
+				}()
+
+				logger := helmexec.NewLogger(logWriter, "debug")
+
+				app := appWithFs(&App{
+					OverrideHelmBinary:  DefaultHelmBinary,
+					glob:                filepath.Glob,
+					abs:                 filepath.Abs,
+					OverrideKubeContext: "default",
+					Env:                 "default",
+					Logger:              logger,
+					helms: map[helmKey]helmexec.Interface{
+						createHelmKey("helm", "default"): helm,
+					},
+				}, tc.files)
+
+				depsErr := app.Deps(depsConfig{
+					skipRepos: false,
+				})
+
+				if tc.error == "" && depsErr != nil {
+					t.Fatalf("unexpected error for data defined at %s: %v", tc.loc, depsErr)
+				} else if tc.error != "" && depsErr == nil {
+					t.Fatalf("expected error did not occur for data defined at %s", tc.loc)
+				} else if tc.error != "" && depsErr != nil && tc.error != depsErr.Error() {
+					t.Fatalf("invalid error: expected %q, got %q", tc.error, depsErr.Error())
+				}
+
+				if !reflect.DeepEqual(helm.Charts, tc.charts) {
+					t.Fatalf("expected charts %v, got %v", helm.Charts, tc.charts)
+				}
+			}()
+
+			if tc.log != "" {
+				actual := bs.String()
+
+				diff, exists := testhelper.Diff(tc.log, actual, 3)
+				if exists {
+					t.Errorf("unexpected log for data defined %s:\nDIFF\n%s\nEOD", tc.loc, diff)
+				}
+			}
+		})
+	}
+}
+
 func captureStdout(f func()) string {
 	reader, writer, err := os.Pipe()
 	if err != nil {
@@ -4050,6 +4231,8 @@ releases:
 func TestList(t *testing.T) {
 	files := map[string]string{
 		"/path/to/helmfile.d/first.yaml": `
+commonLabels:
+  common: label
 releases:
 - name: myrelease1
   chart: mychart1
@@ -4093,11 +4276,11 @@ releases:
 		assert.NilError(t, err)
 	})
 
-	expected := `NAME      	NAMESPACE	ENABLED	LABELS       
-myrelease1	         	false  	id:myrelease1
-myrelease2	         	true   	             
-myrelease3	         	true   	             
-myrelease4	         	true   	id:myrelease1
+	expected := `NAME      	NAMESPACE	ENABLED	LABELS                    
+myrelease1	         	false  	common:label,id:myrelease1
+myrelease2	         	true   	common:label              
+myrelease3	         	true   	                          
+myrelease4	         	true   	id:myrelease1             
 `
 	assert.Equal(t, expected, out)
 }
@@ -4150,12 +4333,8 @@ releases:
 		assert.NilError(t, err)
 	})
 
-	expected := "[" +
-		"{\"name\":\"myrelease1\",\"namespace\":\"\",\"enabled\":false,\"labels\":\"id:myrelease1\"}," +
-		"{\"name\":\"myrelease2\",\"namespace\":\"\",\"enabled\":true,\"labels\":\"\"}," +
-		"{\"name\":\"myrelease3\",\"namespace\":\"\",\"enabled\":true,\"labels\":\"\"}," +
-		"{\"name\":\"myrelease4\",\"namespace\":\"\",\"enabled\":true,\"labels\":\"id:myrelease1\"}" +
-		"]\n"
+	expected := `[{"name":"myrelease1","namespace":"","enabled":false,"labels":"id:myrelease1"},{"name":"myrelease2","namespace":"","enabled":true,"labels":""},{"name":"myrelease3","namespace":"","enabled":true,"labels":""},{"name":"myrelease4","namespace":"","enabled":true,"labels":"id:myrelease1"}]
+`
 	assert.Equal(t, expected, out)
 }
 
